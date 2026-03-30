@@ -7,7 +7,7 @@ Optimizations vs. base version:
   3. No Python loop, full MLX graph optimization
 """
 
-import math
+from turboquant._constants import qjl_scale as _qjl_scale
 
 import mlx.core as mx
 
@@ -63,7 +63,7 @@ def turboquant_scaled_dot_product_attention(
         k_signs_expanded = k_signs_float[:, :, None, :, :]
 
         qjl_scores = q_sketch_grouped @ k_signs_expanded.transpose(0, 1, 2, 4, 3)
-        qjl_scale = math.sqrt(math.pi / 2.0) / D
+        qjl_scale = _qjl_scale(D)
         qjl_scores = qjl_scores * qjl_scale * cache.key_residual_norms[:, :, :T_kv][:, :, None, None, :]
         scores = scores + qjl_scores
 

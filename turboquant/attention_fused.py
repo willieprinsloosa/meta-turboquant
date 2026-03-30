@@ -4,9 +4,9 @@ Uses the fused kernel for T_q=1 (token-by-token generation).
 Falls back to MLX ops for T_q>1 (prefill).
 """
 
-import math
-
 import mlx.core as mx
+
+from turboquant._constants import qjl_scale as _qjl_scale
 
 from turboquant.kernels import fused_tq_attention_norot
 from turboquant.qjl import unpack_sign_bits
@@ -84,7 +84,7 @@ def turboquant_fused_sdpa(
         k_signs_float = unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
         k_signs_expanded = k_signs_float[:, :, None, :, :]
         qjl_scores = q_sketch_grouped @ k_signs_expanded.transpose(0, 1, 2, 4, 3)
-        qjl_scale = math.sqrt(math.pi / 2.0) / D
+        qjl_scale = _qjl_scale(D)
         qjl_scores = qjl_scores * qjl_scale * cache.key_residual_norms[:, :, :T_kv][:, :, None, None, :]
         scores = scores + qjl_scores
 

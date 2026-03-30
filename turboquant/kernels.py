@@ -686,6 +686,12 @@ def fused_tq_attention(
     Returns:
         output: (n_q_heads, D) float32
     """
+    if D != 128:
+        raise ValueError(
+            f"Fused TQ attention kernel requires head_dim=128, got {D}. "
+            "Use the non-fused attention path for models with different head dimensions."
+        )
+
     scale_arr = mx.array([scale], dtype=mx.float32)
     offset_arr = mx.array([causal_offset], dtype=mx.int32)
 
@@ -855,6 +861,12 @@ def fused_tq_attention_norot(
     Returns:
         output_rot: (n_q_heads, D) float32 — in rotated space
     """
+    if D != 128:
+        raise ValueError(
+            f"Fused TQ attention (norot) kernel requires head_dim=128, got {D}. "
+            "Use the non-fused attention path for models with different head dimensions."
+        )
+
     outputs = _fused_attn_norot_kernel(
         inputs=[q_rot, key_packed, centroids, key_norms, value_packed, value_norms],
         grid=(n_q_heads * 1024, 1, 1),

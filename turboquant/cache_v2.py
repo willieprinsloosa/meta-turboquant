@@ -8,11 +8,10 @@ Pre-allocation with step=256 like MLX's QuantizedKVCache for minimal
 allocation overhead.
 """
 
-import math
-
 import mlx.core as mx
 from mlx.utils import tree_map
 
+from turboquant._constants import qjl_scale, qjl_scale_array
 from turboquant.cache import make_causal_mask
 from turboquant.rotation import (
     generate_rotation_matrix,
@@ -62,9 +61,8 @@ class TurboQuantKVCacheV2:
             self.jl_matrix = generate_jl_matrix(head_dim, seed=seed + 95)
             mx.eval(self.jl_matrix)
             self.combined_rot_jl = build_combined_rot_jl(self.rotation_matrix, self.jl_matrix)
-            self.qjl_scale = math.sqrt(math.pi / 2.0) / head_dim
-            self.qjl_scale_arr = mx.array([self.qjl_scale], dtype=mx.float32)
-            mx.eval(self.qjl_scale_arr)
+            self.qjl_scale = qjl_scale(head_dim)
+            self.qjl_scale_arr = qjl_scale_array(head_dim)
 
         self.keys = None
         self.values = None
@@ -222,7 +220,10 @@ class TurboQuantKVCacheV2:
 
     @state.setter
     def state(self, v):
-        pass
+        raise NotImplementedError(
+            "TurboQuantKVCacheV2 does not support state restoration. "
+            "State is quantized on write and cannot be reassigned."
+        )
 
     @property
     def meta_state(self):

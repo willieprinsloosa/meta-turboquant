@@ -18,8 +18,8 @@ def generate_rotation_matrix(head_dim: int, seed: int = 42) -> mx.array:
     Returns:
         Pi: mx.array shape (head_dim, head_dim), orthogonal, float32
     """
-    mx.random.seed(seed)
-    G = mx.random.normal((head_dim, head_dim))
+    key = mx.random.key(seed)
+    G = mx.random.normal((head_dim, head_dim), key=key)
     mx.eval(G)
 
     # QR only possible on CPU
@@ -48,8 +48,8 @@ def generate_jl_matrix(head_dim: int, seed: int = 137) -> mx.array:
     Returns:
         S: mx.array shape (head_dim, head_dim), float32
     """
-    mx.random.seed(seed)
-    S = mx.random.normal((head_dim, head_dim))
+    key = mx.random.key(seed)
+    S = mx.random.normal((head_dim, head_dim), key=key)
     mx.eval(S)
     return S
 

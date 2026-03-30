@@ -176,6 +176,7 @@ def main():
         ("2bit_rot_gs32", "2-bit rotated (gs=32)"),
     ]
 
+    fp16_ppl = None
     for strategy, label in ppl_configs:
         if strategy == "fp16":
             cache = make_prompt_cache(model)
@@ -202,7 +203,11 @@ def main():
                      use_rotation=True, use_normalization=True, seed=42+i) for i in range(n_layers)]
 
         ppl = compute_perplexity(model, tokenizer, EVAL_TEXT, cache)
-        delta = ((ppl / 12.94) - 1) * 100 if strategy != "fp16" else 0
+        if strategy == "fp16":
+            fp16_ppl = ppl
+            delta = 0.0
+        else:
+            delta = ((ppl / fp16_ppl) - 1) * 100
         sign = "+" if delta >= 0 else ""
         print(f"  {label:30s}  PPL: {ppl:6.2f}  ({sign}{delta:.1f}%)")
 

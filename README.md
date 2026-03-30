@@ -1,8 +1,124 @@
-# TurboQuant MLX — KV-Cache Compression on Apple Silicon
+# Meta-TurboQuant — KV-Cache Compression on Apple Silicon
+
+> **Originally created by [sharpner](https://github.com/sharpner/turboquant-mlx).** This fork builds on that excellent work with architectural improvements, bug fixes, and engineering enhancements. Full credit to the original author for the core implementation.
 
 Reproduction of KV-Cache quantization from [TurboQuant (Google, 2025)](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) ([Paper](https://arxiv.org/abs/2504.19874)) on Apple Silicon using [MLX](https://github.com/ml-explore/mlx).
 
 **Result:** Up to 5.5x KV-Cache compression. Two paths: V2 (hardware-accelerated, `mx.quantized_matmul`) for speed, V3 (Lloyd-Max codebook, paper-correct) for maximum quality. Mostly MLX-native ops, with a custom Metal kernel for fused QJL sign-bit scoring.
+
+## Requirements
+
+- Apple Silicon Mac (M1/M2/M3/M4)
+- Python 3.10+ (**must be arm64**, not Rosetta/x86_64)
+- macOS 13.5+
+
+## Installation
+
+### Option 1: pip install (recommended)
+
+```bash
+# Create a virtual environment with arm64 Python
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install the package and dependencies
+pip install -e .
+```
+
+### Option 2: Install dependencies only
+
+```bash
+pip install mlx mlx-lm numpy
+
+# Verify MLX works on your hardware
+python -c "import mlx.core as mx; print(mx.default_device())"
+# Should print: Device(gpu, 0)
+```
+
+### Verify installation
+
+```bash
+# Run the test suite (52 tests)
+pip install pytest
+python -m pytest tests/ -v
+
+# Quick demo — generates text with compressed KV-cache
+python run_llm.py
+```
+
+> **Note:** If `pip install mlx` fails with "No matching distribution found", your Python is likely running under Rosetta (x86_64). Check with `python3 -c "import platform; print(platform.machine())"` — it must print `arm64`. Use `/opt/homebrew/bin/python3` or install an arm64 Python via Homebrew.
+
+## Quick Start
+
+```bash
+# Demo: text generation with compressed KV cache
+python run_llm.py
+
+# Benchmark: speed + quality + perplexity
+python benchmark.py
+
+# Long-context benchmark: throughput at 512-8192 tokens
+python benchmark_longseq.py
+
+# Multi-model benchmark: PPL across 4 models
+python benchmark_models.py
+```
+
+### Use in your own code
+
+```python
+import mlx_lm
+from turboquant.cache_v2 import TurboQuantKVCacheV2
+from turboquant.cache_v3 import TurboQuantKVCacheV3
+import turboquant.patch as tq_patch
+
+tq_patch.apply()  # Monkey-patch mlx-lm SDPA dispatch
+
+model, tokenizer = mlx_lm.load("mlx-community/Llama-3.2-3B-Instruct-4bit")
+head_dim = model.layers[0].self_attn.head_dim
+n_layers = len(model.layers)
+
+# Option A: V2 4-bit (fast, hardware-accelerated, 3.1x compression)
+cache = [
+    TurboQuantKVCacheV2(
+        head_dim=head_dim, bits=4, group_size=64,
+        use_rotation=True, use_normalization=True, seed=42 + i,
+    )
+    for i in range(n_layers)
+]
+
+# Option B: V3 3.5-bit mixed (near-lossless, 4.1x compression)
+cache = [
+    TurboQuantKVCacheV3(
+        head_dim=head_dim, bits=3,
+        n_outlier=64, outlier_bits=4, seed=42 + i,
+    )
+    for i in range(n_layers)
+]
+
+# Use cache with mlx-lm's generate_step
+from mlx_lm.generate import generate_step
+import mlx.core as mx
+
+input_ids = mx.array(tokenizer.encode("Hello, world!"))
+for token, _ in generate_step(prompt=input_ids, model=model, prompt_cache=cache):
+    print(tokenizer.decode([token.item()]), end="", flush=True)
+    if token.item() == tokenizer.eos_token_id:
+        break
+```
+
+## Changes in this fork
+
+- Fixed global random seed mutation (thread-safe `mx.random.key()`)
+- Fixed V3 memory accounting — removed persistent dequant caches that inflated memory beyond fp16
+- V3 attention now uses fused QJL Metal kernel (avoids 32x memory blowup)
+- Consolidated duplicated constants into shared `_constants.py`
+- Added `pyproject.toml` for proper packaging (`pip install -e .`)
+- Added `TurboQuantCache` Protocol for version-agnostic cache interface
+- Added runtime validation for Metal kernel head_dim constraints
+- V1 legacy code deprecated with warnings, lazy-loaded
+- State setter raises `NotImplementedError` instead of silently dropping data
+- Fixed hardcoded baseline PPL in experiment_2bit.py
 
 ## Benchmark Results
 
@@ -158,58 +274,6 @@ The QJL correction applies a **linear** correction to attention scores, but soft
 QJL *does* work when added as extra information (V2 3-bit rot+QJL: +5.3% vs +6.6% without QJL), but not when it replaces MSE bits (TurboQuant_prod). This holds across all tested dimensions and models.
 
 **Note:** The paper may achieve different results with custom CUDA kernels, full-precision weight models, and potentially different QJL scaling. Our models use 4-bit weight quantization, which compounds KV cache quantization error.
-
-## Quickstart
-
-```bash
-# Requirements: Apple Silicon Mac with Python 3.10+
-pip install mlx mlx-lm
-
-# Demo: text generation with compressed KV cache
-python run_llm.py
-
-# Benchmark: speed + quality
-python benchmark.py
-
-# Long-context benchmark: throughput at 512-8192 tokens
-python benchmark_longseq.py
-
-# Multi-model benchmark: PPL across 4 models (incl. Gemma D=256)
-python benchmark_models.py
-```
-
-### Custom Models
-
-```python
-import mlx_lm
-from turboquant.cache_v2 import TurboQuantKVCacheV2
-from turboquant.cache_v3 import TurboQuantKVCacheV3
-import turboquant.patch as tq_patch
-
-tq_patch.apply()  # Monkey-patch SDPA dispatch
-
-model, tokenizer = mlx_lm.load("mlx-community/Llama-3.2-3B-Instruct-4bit")
-head_dim = model.layers[0].self_attn.head_dim
-n_layers = len(model.layers)
-
-# Option A: V2 4-bit (fast, hardware-accelerated)
-cache = [
-    TurboQuantKVCacheV2(
-        head_dim=head_dim, bits=4, group_size=64,
-        use_rotation=True, use_normalization=True,
-    )
-    for _ in range(n_layers)
-]
-
-# Option B: V3 3.5-bit mixed (near-lossless, 4.1x compression)
-cache = [
-    TurboQuantKVCacheV3(
-        head_dim=head_dim, bits=3,
-        n_outlier=64, outlier_bits=4,  # 64 channels @ 4-bit, 64 @ 3-bit
-    )
-    for _ in range(n_layers)
-]
-```
 
 ## Project Structure
 

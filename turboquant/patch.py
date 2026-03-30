@@ -1,16 +1,16 @@
 """Monkey-patch for mlx-lm's SDPA dispatch.
 
-Supports TurboQuant V1 (fused Metal kernel), V2 (mx.quantized_matmul),
-V3 (Lloyd-Max codebook with software dequant).
+Supports TurboQuant V2 (mx.quantized_matmul) and V3 (Lloyd-Max codebook).
+V1 (legacy fused Metal kernel) is deprecated — use V2 or V3 instead.
 """
+
+import warnings
 
 import mlx.core as mx
 import mlx_lm.models.base as _base
 
-from turboquant.attention_fused import turboquant_fused_sdpa
 from turboquant.attention_v2 import turboquant_v2_sdpa
 from turboquant.attention_v3 import turboquant_v3_sdpa
-from turboquant.cache import TurboQuantKVCache
 from turboquant.cache_v2 import TurboQuantKVCacheV2
 from turboquant.cache_v3 import TurboQuantKVCacheV3
 
@@ -23,7 +23,15 @@ def _patched_sdpa(queries, keys, values, cache, scale, mask, **kwargs):
         return turboquant_v3_sdpa(queries, cache, scale, mask)
     if isinstance(cache, TurboQuantKVCacheV2):
         return turboquant_v2_sdpa(queries, keys, values, cache, scale, mask)
+    # V1 legacy fallback — lazy import to avoid loading dead code by default
+    from turboquant.cache import TurboQuantKVCache
     if isinstance(cache, TurboQuantKVCache):
+        warnings.warn(
+            "TurboQuantKVCache (V1) is deprecated. Use TurboQuantKVCacheV2 or V3.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from turboquant.attention_fused import turboquant_fused_sdpa
         return turboquant_fused_sdpa(queries, cache, scale, mask)
     return _original_sdpa(queries, keys, values, cache, scale, mask, **kwargs)
 

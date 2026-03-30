@@ -231,6 +231,12 @@ def fused_v2_attention(
     Returns:
         output_rot: (n_q_heads, D) float32 — in rotated space
     """
+    if D != 128:
+        raise ValueError(
+            f"Fused V2 attention kernel requires head_dim=128, got {D}. "
+            "Use the non-fused attention path for models with different head dimensions."
+        )
+
     scale_arr = mx.array([qjl_scale], dtype=mx.float32)
     bits_arr = mx.array([bits], dtype=mx.float32)
 

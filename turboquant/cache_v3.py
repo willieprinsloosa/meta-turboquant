@@ -12,9 +12,9 @@ channel split works as well as dynamic outlier detection.
 Uses pure MLX operations — no custom Metal kernels, no mx.quantized_matmul.
 Pre-allocation with step=256 for minimal allocation overhead.
 
-Performance: Dequantized centroids are cached incrementally. Only newly
-added slices are dequantized — get_key_centroids() / get_value_centroids()
-return pre-computed buffers directly.
+Performance: Centroids are dequantized on-demand during attention via
+get_key_centroids() / get_value_centroids(). No persistent dequant cache
+is stored, keeping actual memory usage honest to the compression ratio.
 """
 
 import mlx.core as mx
@@ -142,9 +142,8 @@ class TurboQuantKVCacheV3:
         self._key_sign_bits_buf = None
         self._key_residual_norms_buf = None
 
-        # --- Dequantized centroid caches (P1: incremental) ---
-        self._key_centroids_cache = None
-        self._value_centroids_cache = None
+        # No persistent dequant caches — centroids are computed on-demand
+        # via dequantize_keys() / dequantize_values() during attention.
 
     @property
     def key_sign_bits(self):
@@ -215,18 +214,6 @@ class TurboQuantKVCacheV3:
                 self._key_sign_bits_buf = mx.zeros((B, n_kv_heads, total_steps, n_proj_words), dtype=mx.uint32)
                 self._key_residual_norms_buf = mx.zeros((B, n_kv_heads, total_steps), dtype=mx.float32)
 
-        # Dequant cache buffers
-        if self._key_centroids_cache is not None:
-            kc_old = self._key_centroids_cache if prev % self.step == 0 else self._key_centroids_cache[:, :, :prev, :]
-            vc_old = self._value_centroids_cache if prev % self.step == 0 else self._value_centroids_cache[:, :, :prev, :]
-            self._key_centroids_cache = mx.concatenate([kc_old, mx.zeros((B, n_kv_heads, new_steps, self.head_dim), dtype=mx.float32)], axis=2)
-            self._value_centroids_cache = mx.concatenate([vc_old, mx.zeros((B, n_kv_heads, new_steps, self.head_dim), dtype=mx.float32)], axis=2)
-        else:
-            total_steps = new_steps
-            if self.key_regular_packed is not None:
-                total_steps = self.key_regular_packed.shape[2]
-            self._key_centroids_cache = mx.zeros((B, n_kv_heads, total_steps, self.head_dim), dtype=mx.float32)
-            self._value_centroids_cache = mx.zeros((B, n_kv_heads, total_steps, self.head_dim), dtype=mx.float32)
 
     def _dequant_slice(self, indices_or_packed, is_key, is_outlier=False):
         """Dequantize a slice of indices to centroid values.
@@ -326,19 +313,38 @@ class TurboQuantKVCacheV3:
             self._key_sign_bits_buf[:, :, prev:self.offset, :] = k_sign_bits
             self._key_residual_norms_buf[:, :, prev:self.offset] = k_residual_norms
 
-        # Incrementally update dequant caches (P1)
-        self._key_centroids_cache[:, :, prev:self.offset, :] = k_centroid_vals
-        self._value_centroids_cache[:, :, prev:self.offset, :] = v_centroid_vals
-
         return keys, values
 
+    def _dequant_all(self, is_key: bool) -> mx.array:
+        """Dequantizes all stored tokens on-demand. Transient — not cached."""
+        T = self.offset
+        if self.mixed:
+            # Outlier channels
+            out_packed = (self.key_outlier_packed if is_key else self.value_outlier_packed)[:, :, :T, :]
+            out_bits = self.key_outlier_bits if is_key else self.outlier_bits
+            out_indices = _unpack(out_packed, self.n_outlier, out_bits)
+            out_vals = self._dequant_slice(out_indices, is_key, is_outlier=True)
+
+            # Regular channels
+            reg_packed = (self.key_regular_packed if is_key else self.value_regular_packed)[:, :, :T, :]
+            reg_bits = self.key_regular_bits if is_key else self.regular_bits
+            reg_indices = _unpack(reg_packed, self.n_regular, reg_bits)
+            reg_vals = self._dequant_slice(reg_indices, is_key, is_outlier=False)
+
+            return mx.concatenate([out_vals, reg_vals], axis=-1)
+
+        reg_packed = (self.key_regular_packed if is_key else self.value_regular_packed)[:, :, :T, :]
+        reg_bits = self.key_regular_bits if is_key else self.regular_bits
+        reg_indices = _unpack(reg_packed, self.head_dim, reg_bits)
+        return self._dequant_slice(reg_indices, is_key)
+
     def get_key_centroids(self) -> mx.array:
-        """Returns cached dequantized key centroids. O(1) — no re-dequantization."""
-        return self._key_centroids_cache[:, :, :self.offset, :]
+        """Dequantizes key centroids on-demand. No persistent cache."""
+        return self._dequant_all(is_key=True)
 
     def get_value_centroids(self) -> mx.array:
-        """Returns cached dequantized value centroids. O(1) — no re-dequantization."""
-        return self._value_centroids_cache[:, :, :self.offset, :]
+        """Dequantizes value centroids on-demand. No persistent cache."""
+        return self._dequant_all(is_key=False)
 
     def make_mask(self, N, return_array=False, window_size=None, **kwargs):
         return make_causal_mask(self.offset, N, return_array, window_size)
@@ -360,16 +366,14 @@ class TurboQuantKVCacheV3:
             ]
         if self.use_qjl and self.key_sign_bits is not None:
             parts += [self.key_sign_bits, self.key_residual_norms]
-        # Include dequant caches
-        parts += [
-            self._key_centroids_cache[:, :, :self.offset, :],
-            self._value_centroids_cache[:, :, :self.offset, :],
-        ]
         return parts
 
     @state.setter
     def state(self, v):
-        pass
+        raise NotImplementedError(
+            "TurboQuantKVCacheV3 does not support state restoration. "
+            "State is quantized on write and cannot be reassigned."
+        )
 
     @property
     def meta_state(self):
@@ -409,8 +413,6 @@ class TurboQuantKVCacheV3:
         if self.use_qjl and self._key_sign_bits_buf is not None:
             total += B * n_kv_heads * T * self._key_sign_bits_buf.shape[-1] * 4
             total += B * n_kv_heads * T * 4
-        # NOTE: dequant caches (_key_centroids_cache, _value_centroids_cache) are
-        # a speed optimization, not compressed storage. Excluded from nbytes.
         return total
 
     @property
