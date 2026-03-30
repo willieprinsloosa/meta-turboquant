@@ -45,6 +45,7 @@ N_LAYERS = 0
 STRATEGY = "v2"
 BITS = 4
 GROUP_SIZE = 64
+LEAN = False
 
 
 def make_cache():
@@ -60,7 +61,7 @@ def make_cache():
         return [
             TurboQuantKVCacheV2(
                 head_dim=HEAD_DIM, bits=BITS, group_size=GROUP_SIZE,
-                use_rotation=True, use_normalization=True, seed=42 + i,
+                use_rotation=not LEAN, use_normalization=not LEAN, seed=42 + i,
             )
             for i in range(N_LAYERS)
         ]
@@ -168,8 +169,7 @@ _inference_lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Quieter logging
-        pass
+        print(f"  {self.client_address[0]} {format % args}")
 
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode()
@@ -191,6 +191,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_cors()
 
     def do_GET(self):
+        print(f"\n>> GET {self.path}")
         if self.path == "/v1/models":
             self._send_json({
                 "object": "list",
@@ -334,6 +335,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f"  [responses] [{tok_count} tokens, {elapsed:.1f}s, {tok_count/elapsed:.0f} tok/s]")
 
     def do_POST(self):
+        print(f"\n>> POST {self.path}")
         if self.path == "/v1/chat/completions":
             body = self._parse_body()
             with _inference_lock:
@@ -355,19 +357,22 @@ def main():
     parser.add_argument("--strategy", default=os.environ.get("TURBOQUANT_STRATEGY", "v2"), choices=["v2", "v3"])
     parser.add_argument("--bits", type=int, default=int(os.environ.get("TURBOQUANT_BITS", "4")), choices=[2, 3, 4])
     parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--lean", action="store_true", help="LEAN mode: no rotation, maximum speed")
     args = parser.parse_args()
 
     MODEL_NAME = args.model
     STRATEGY = args.strategy
     BITS = args.bits
     GROUP_SIZE = args.group_size
+    LEAN = args.lean
 
     print(f"Loading model: {MODEL_NAME}")
     MODEL, TOKENIZER = mlx_lm.load(MODEL_NAME)
     HEAD_DIM = MODEL.layers[0].self_attn.head_dim
     N_LAYERS = len(MODEL.layers)
     print(f"  {N_LAYERS} layers, head_dim={HEAD_DIM}")
-    print(f"  Strategy: {STRATEGY.upper()} {BITS}-bit (group_size={GROUP_SIZE})")
+    mode = "LEAN" if LEAN else "rotated"
+    print(f"  Strategy: {STRATEGY.upper()} {BITS}-bit {mode} (group_size={GROUP_SIZE})")
 
     # Warmup
     print("Warming up...")
