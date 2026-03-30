@@ -23,6 +23,8 @@ import sys
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import threading
 
 import mlx.core as mx
 import mlx_lm
@@ -152,6 +154,16 @@ def make_responses_response(content, model_name):
         }],
         "status": "completed",
     }
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle each request in a new thread so health checks don't block."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+# Lock to serialize MLX inference (not thread-safe)
+_inference_lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -323,9 +335,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/v1/chat/completions":
-            self._handle_chat(self._parse_body())
+            body = self._parse_body()
+            with _inference_lock:
+                self._handle_chat(body)
         elif self.path == "/v1/responses":
-            self._handle_responses(self._parse_body())
+            body = self._parse_body()
+            with _inference_lock:
+                self._handle_responses(body)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -361,7 +377,7 @@ def main():
         break
     print("Ready.")
 
-    server = HTTPServer(("0.0.0.0", args.port), Handler)
+    server = ThreadedHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"\nServing on http://localhost:{args.port}")
     print(f"  POST /v1/chat/completions  — OpenAI-compatible chat")
     print(f"  GET  /v1/models            — list models")
