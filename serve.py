@@ -132,6 +132,28 @@ def make_stream_chunk(content, model_name, finish=False):
     }
 
 
+def make_responses_response(content, model_name):
+    """Formats an OpenAI Responses API response."""
+    resp_id = f"resp-{uuid.uuid4().hex[:12]}"
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model_name,
+        "output": [{
+            "type": "message",
+            "id": f"msg-{uuid.uuid4().hex[:12]}",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": content,
+            }],
+            "status": "completed",
+        }],
+        "status": "completed",
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Quieter logging
@@ -177,14 +199,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "not found"}, 404)
 
-    def do_POST(self):
-        if self.path != "/v1/chat/completions":
-            self._send_json({"error": "not found"}, 404)
-            return
-
+    def _parse_body(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length))
+        return json.loads(self.rfile.read(length))
 
+    def _handle_chat(self, body):
+        """Handles /v1/chat/completions requests."""
         messages = body.get("messages", [])
         max_tokens = body.get("max_tokens", 512)
         temperature = body.get("temperature", 0.7)
@@ -224,6 +244,90 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(response)
             tok_count = len(TOKENIZER.encode(full_text))
             print(f"  [{tok_count} tokens, {elapsed:.1f}s, {tok_count/elapsed:.0f} tok/s]")
+
+    def _handle_responses(self, body):
+        """Handles /v1/responses requests (OpenAI Responses API)."""
+        # The Responses API uses 'input' (string or messages array)
+        input_data = body.get("input", "")
+        max_tokens = body.get("max_output_tokens", body.get("max_tokens", 512))
+        temperature = body.get("temperature", 0.7)
+        model_id = body.get("model", MODEL_NAME)
+        stream = body.get("stream", False)
+
+        # Convert input to messages format
+        if isinstance(input_data, str):
+            messages = [{"role": "user", "content": input_data}]
+        elif isinstance(input_data, list):
+            # Could be messages array or content blocks
+            messages = []
+            for item in input_data:
+                if isinstance(item, dict) and "role" in item:
+                    messages.append(item)
+                elif isinstance(item, dict) and "type" in item:
+                    # Content block format
+                    if item.get("type") == "message":
+                        messages.append({
+                            "role": item.get("role", "user"),
+                            "content": item.get("content", ""),
+                        })
+                    elif item.get("type") == "input_text":
+                        messages.append({"role": "user", "content": item.get("text", "")})
+                else:
+                    messages.append({"role": "user", "content": str(item)})
+            if not messages:
+                messages = [{"role": "user", "content": str(input_data)}]
+        else:
+            messages = [{"role": "user", "content": str(input_data)}]
+
+        if not messages:
+            self._send_json({"error": "input required"}, 400)
+            return
+
+        start = time.perf_counter()
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            # Responses API streaming uses different event types
+            resp_id = f"resp-{uuid.uuid4().hex[:12]}"
+            # Send response.created
+            self.wfile.write(f"data: {json.dumps({'type': 'response.created', 'response': {'id': resp_id, 'status': 'in_progress'}})}\n\n".encode())
+            self.wfile.flush()
+
+            for chunk_text in generate(messages, max_tokens, temperature, stream=True):
+                event = {
+                    "type": "response.output_text.delta",
+                    "delta": chunk_text,
+                }
+                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                self.wfile.flush()
+
+            # Send response.completed
+            self.wfile.write(f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'status': 'completed'}})}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        else:
+            full_text = ""
+            for text in generate(messages, max_tokens, temperature, stream=False):
+                full_text = text
+
+            elapsed = time.perf_counter() - start
+            response = make_responses_response(full_text, model_id)
+            self._send_json(response)
+            tok_count = len(TOKENIZER.encode(full_text))
+            print(f"  [responses] [{tok_count} tokens, {elapsed:.1f}s, {tok_count/elapsed:.0f} tok/s]")
+
+    def do_POST(self):
+        if self.path == "/v1/chat/completions":
+            self._handle_chat(self._parse_body())
+        elif self.path == "/v1/responses":
+            self._handle_responses(self._parse_body())
+        else:
+            self._send_json({"error": "not found"}, 404)
 
 
 def main():
