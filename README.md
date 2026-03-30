@@ -107,6 +107,117 @@ for token, _ in generate_step(prompt=input_ids, model=model, prompt_cache=cache)
         break
 ```
 
+## Local LLM Server
+
+Meta-TurboQuant includes an **OpenAI-compatible HTTP server** that serves local MLX models with TurboQuant KV-cache compression. Works with OpenClaw, Continue.dev, or any OpenAI-compatible client.
+
+### Start the server
+
+```bash
+source .venv/bin/activate
+
+# Default: Llama 3.2 3B with V2 4-bit compression
+python serve.py
+
+# Larger model (still fits 16GB Mac)
+python serve.py --model mlx-community/Llama-3.1-8B-Instruct-4bit
+
+# More compression (3-bit, 3.8x savings)
+python serve.py --bits 3
+
+# V3 strategy (better quality, slower)
+python serve.py --strategy v3 --bits 3
+
+# Custom port
+python serve.py --port 8800
+```
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | OpenAI Chat Completions API |
+| `/v1/responses` | POST | OpenAI Responses API (used by OpenClaw) |
+| `/v1/models` | GET | List available models |
+| `/health` | GET | Health check |
+
+### Example requests
+
+```bash
+# Chat completion
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":256}'
+
+# Responses API (OpenClaw format)
+curl http://localhost:11434/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"input":"What is machine learning?","max_output_tokens":256}'
+
+# Streaming
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+```
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TURBOQUANT_MODEL` | `mlx-community/Llama-3.2-3B-Instruct-4bit` | Model to load |
+| `TURBOQUANT_PORT` | `11434` | Server port |
+| `TURBOQUANT_STRATEGY` | `v2` | Compression strategy (`v2` or `v3`) |
+| `TURBOQUANT_BITS` | `4` | Quantization bits (2, 3, or 4) |
+
+### Recommended models for 16GB Mac
+
+| Model | Size | Best for |
+|-------|------|----------|
+| `mlx-community/Llama-3.2-1B-Instruct-4bit` | ~0.7 GB | Fastest, lightweight tasks |
+| `mlx-community/Llama-3.2-3B-Instruct-4bit` | ~1.8 GB | Good balance (default) |
+| `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | ~4.5 GB | Strong 7B quality |
+| `mlx-community/Llama-3.1-8B-Instruct-4bit` | ~4.5 GB | Best quality at 8B |
+| `mlx-community/Qwen2.5-7B-Instruct-4bit` | ~4.5 GB | Strong multilingual |
+
+With TurboQuant V2 4-bit compression, an 8B model on 16GB can handle ~32K context tokens.
+
+## OpenClaw Integration
+
+Meta-TurboQuant can serve as a **local LLM provider** for [OpenClaw](https://github.com/openclaw/openclaw).
+
+### 1. Start the server
+
+```bash
+python serve.py
+```
+
+### 2. Configure OpenClaw
+
+Add to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "providers": {
+    "turboquant": {
+      "type": "openai",
+      "baseUrl": "http://localhost:11434/v1",
+      "apiKey": "local",
+      "models": ["mlx-community/Llama-3.2-3B-Instruct-4bit"]
+    }
+  }
+}
+```
+
+### 3. Install the skill (optional)
+
+Copy the bundled OpenClaw skill for guided usage:
+
+```bash
+cp -r openclaw-skill ~/.openclaw/skills/turboquant-local-llm
+```
+
+This teaches OpenClaw when and how to use your local TurboQuant model.
+
 ## Changes in this fork
 
 - Fixed global random seed mutation (thread-safe `mx.random.key()`)
@@ -119,6 +230,8 @@ for token, _ in generate_step(prompt=input_ids, model=model, prompt_cache=cache)
 - V1 legacy code deprecated with warnings, lazy-loaded
 - State setter raises `NotImplementedError` instead of silently dropping data
 - Fixed hardcoded baseline PPL in experiment_2bit.py
+- Added `serve.py` — OpenAI-compatible local LLM server with `/v1/chat/completions` and `/v1/responses`
+- Added OpenClaw skill for local inference integration
 
 ## Benchmark Results
 
@@ -289,18 +402,23 @@ turboquant/
 ├── fused_qjl.py         # Fused Metal kernel for QJL sign-bit dot products
 ├── patch.py             # Monkey-patch for mlx-lm SDPA dispatch
 ├── rotation.py          # Random rotation (QR) + JL matrix generation
+├── protocol.py          # TurboQuantCache Protocol interface
+├── _constants.py        # Shared constants (QJL scale, etc.)
 ├── kernels.py           # V1: Metal kernels + packing (legacy)
 ├── cache.py             # V1: cache (legacy)
 ├── attention.py         # V1: attention (legacy)
 └── attention_fused.py   # V1: fused attention (legacy)
 
+serve.py                 # OpenAI-compatible local LLM server
+run_llm.py               # Interactive demo
 benchmark.py             # Speed + quality benchmark
 benchmark_common.py      # Shared eval text and perplexity computation
 benchmark_longseq.py     # Long-context throughput benchmark
 benchmark_models.py      # Multi-model PPL comparison
-run_llm.py               # Interactive demo
+openclaw-skill/
+└── SKILL.md             # OpenClaw AgentSkill for local inference
 tests/
-├── test_turboquant.py   # 58 unit tests (core components)
+├── test_turboquant.py   # 52 unit tests (core components)
 └── test_metal_barrier.py # Metal kernel barrier reproduction test
 ```
 
