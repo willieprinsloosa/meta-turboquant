@@ -253,10 +253,18 @@ class Handler(BaseHTTPRequestHandler):
                 full_text = text
 
             elapsed = time.perf_counter() - start
-            response = make_response(full_text, model_id)
+            prompt_tokens = len(TOKENIZER.encode(
+                TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            ))
+            completion_tokens = len(TOKENIZER.encode(full_text))
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+            response = make_response(full_text, model_id, usage)
             self._send_json(response)
-            tok_count = len(TOKENIZER.encode(full_text))
-            print(f"  [{tok_count} tokens, {elapsed:.1f}s, {tok_count/elapsed:.0f} tok/s]")
+            print(f"  [{completion_tokens} tokens, {elapsed:.1f}s, {completion_tokens/elapsed:.0f} tok/s]")
 
     def _handle_responses(self, body):
         """Handles /v1/responses requests (OpenAI Responses API)."""
