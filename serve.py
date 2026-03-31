@@ -320,6 +320,7 @@ class Handler(BaseHTTPRequestHandler):
         start = time.perf_counter()
 
         if stream:
+            # Use chat completions streaming format — widely supported by clients
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -327,84 +328,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            resp_id = f"resp_{uuid.uuid4().hex[:12]}"
-            item_id = f"item_{uuid.uuid4().hex[:8]}"
-            output_idx = 0
-
-            def _sse(event_type, data):
-                self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
+            for chunk_text in generate(messages, max_tokens, temperature, stream=True):
+                chunk = make_stream_chunk(chunk_text, model_id)
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
 
-            # 1. response.created
-            _sse("response.created", {
-                "type": "response.created",
-                "response": {"id": resp_id, "object": "response", "status": "in_progress",
-                              "model": model_id, "output": []},
-            })
-
-            # 2. response.output_item.added
-            _sse("response.output_item.added", {
-                "type": "response.output_item.added",
-                "output_index": output_idx,
-                "item": {"id": item_id, "type": "message", "role": "assistant",
-                         "status": "in_progress", "content": []},
-            })
-
-            # 3. response.content_part.added
-            _sse("response.content_part.added", {
-                "type": "response.content_part.added",
-                "item_id": item_id, "output_index": output_idx, "content_index": 0,
-                "part": {"type": "output_text", "text": ""},
-            })
-
-            # 4. Stream text deltas
-            full_text = ""
-            for chunk_text in generate(messages, max_tokens, temperature, stream=True):
-                full_text += chunk_text
-                _sse("response.output_text.delta", {
-                    "type": "response.output_text.delta",
-                    "item_id": item_id, "output_index": output_idx, "content_index": 0,
-                    "delta": chunk_text,
-                })
-
-            # 5. response.output_text.done
-            _sse("response.output_text.done", {
-                "type": "response.output_text.done",
-                "item_id": item_id, "output_index": output_idx, "content_index": 0,
-                "text": full_text,
-            })
-
-            # 6. response.content_part.done
-            _sse("response.content_part.done", {
-                "type": "response.content_part.done",
-                "item_id": item_id, "output_index": output_idx, "content_index": 0,
-                "part": {"type": "output_text", "text": full_text},
-            })
-
-            # 7. response.output_item.done
-            _sse("response.output_item.done", {
-                "type": "response.output_item.done",
-                "output_index": output_idx,
-                "item": {"id": item_id, "type": "message", "role": "assistant",
-                         "status": "completed",
-                         "content": [{"type": "output_text", "text": full_text}]},
-            })
-
-            # 8. response.completed
-            _sse("response.completed", {
-                "type": "response.completed",
-                "response": {
-                    "id": resp_id, "object": "response", "status": "completed",
-                    "model": model_id,
-                    "output": [{"id": item_id, "type": "message", "role": "assistant",
-                                "status": "completed",
-                                "content": [{"type": "output_text", "text": full_text}]}],
-                },
-            })
+            final = make_stream_chunk("", model_id, finish=True)
+            self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
 
             elapsed = time.perf_counter() - start
-            tok_count = len(TOKENIZER.encode(full_text))
-            print(f"  [responses stream] [{tok_count} tokens, {elapsed:.1f}s, {tok_count/elapsed:.0f} tok/s]")
+            print(f"  [responses stream] [{elapsed:.1f}s]")
         else:
             full_text = ""
             for text in generate(messages, max_tokens, temperature, stream=False):
