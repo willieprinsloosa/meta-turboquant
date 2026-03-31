@@ -276,19 +276,32 @@ class Handler(BaseHTTPRequestHandler):
         stream = body.get("stream", False)
 
         # Convert input to messages format
+        # Map roles: "developer" -> "system" (Atomic Chat / OpenAI convention)
+        def _map_role(role):
+            return "system" if role == "developer" else role
+
         if isinstance(input_data, str):
             messages = [{"role": "user", "content": input_data}]
         elif isinstance(input_data, list):
-            # Could be messages array or content blocks
             messages = []
             for item in input_data:
                 if isinstance(item, dict) and "role" in item:
-                    messages.append(item)
+                    role = _map_role(item["role"])
+                    content = item.get("content", "")
+                    # Content can be a string or list of content blocks
+                    if isinstance(content, list):
+                        text_parts = []
+                        for block in content:
+                            if isinstance(block, dict):
+                                text_parts.append(block.get("text", block.get("content", "")))
+                            else:
+                                text_parts.append(str(block))
+                        content = "\n".join(text_parts)
+                    messages.append({"role": role, "content": content})
                 elif isinstance(item, dict) and "type" in item:
-                    # Content block format
                     if item.get("type") == "message":
                         messages.append({
-                            "role": item.get("role", "user"),
+                            "role": _map_role(item.get("role", "user")),
                             "content": item.get("content", ""),
                         })
                     elif item.get("type") == "input_text":
@@ -310,27 +323,88 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            # Responses API streaming uses different event types
-            resp_id = f"resp-{uuid.uuid4().hex[:12]}"
-            # Send response.created
-            self.wfile.write(f"data: {json.dumps({'type': 'response.created', 'response': {'id': resp_id, 'status': 'in_progress'}})}\n\n".encode())
-            self.wfile.flush()
+            resp_id = f"resp_{uuid.uuid4().hex[:12]}"
+            item_id = f"item_{uuid.uuid4().hex[:8]}"
+            output_idx = 0
 
-            for chunk_text in generate(messages, max_tokens, temperature, stream=True):
-                event = {
-                    "type": "response.output_text.delta",
-                    "delta": chunk_text,
-                }
-                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            def _sse(event_type, data):
+                self.wfile.write(f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode())
                 self.wfile.flush()
 
-            # Send response.completed
-            self.wfile.write(f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'status': 'completed'}})}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            # 1. response.created
+            _sse("response.created", {
+                "type": "response.created",
+                "response": {"id": resp_id, "object": "response", "status": "in_progress",
+                              "model": model_id, "output": []},
+            })
+
+            # 2. response.output_item.added
+            _sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": output_idx,
+                "item": {"id": item_id, "type": "message", "role": "assistant",
+                         "status": "in_progress", "content": []},
+            })
+
+            # 3. response.content_part.added
+            _sse("response.content_part.added", {
+                "type": "response.content_part.added",
+                "item_id": item_id, "output_index": output_idx, "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            })
+
+            # 4. Stream text deltas
+            full_text = ""
+            for chunk_text in generate(messages, max_tokens, temperature, stream=True):
+                full_text += chunk_text
+                _sse("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "item_id": item_id, "output_index": output_idx, "content_index": 0,
+                    "delta": chunk_text,
+                })
+
+            # 5. response.output_text.done
+            _sse("response.output_text.done", {
+                "type": "response.output_text.done",
+                "item_id": item_id, "output_index": output_idx, "content_index": 0,
+                "text": full_text,
+            })
+
+            # 6. response.content_part.done
+            _sse("response.content_part.done", {
+                "type": "response.content_part.done",
+                "item_id": item_id, "output_index": output_idx, "content_index": 0,
+                "part": {"type": "output_text", "text": full_text},
+            })
+
+            # 7. response.output_item.done
+            _sse("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": output_idx,
+                "item": {"id": item_id, "type": "message", "role": "assistant",
+                         "status": "completed",
+                         "content": [{"type": "output_text", "text": full_text}]},
+            })
+
+            # 8. response.completed
+            _sse("response.completed", {
+                "type": "response.completed",
+                "response": {
+                    "id": resp_id, "object": "response", "status": "completed",
+                    "model": model_id,
+                    "output": [{"id": item_id, "type": "message", "role": "assistant",
+                                "status": "completed",
+                                "content": [{"type": "output_text", "text": full_text}]}],
+                },
+            })
+
+            elapsed = time.perf_counter() - start
+            tok_count = len(TOKENIZER.encode(full_text))
+            print(f"  [responses stream] [{tok_count} tokens, {elapsed:.1f}s, {tok_count/elapsed:.0f} tok/s]")
         else:
             full_text = ""
             for text in generate(messages, max_tokens, temperature, stream=False):
@@ -344,12 +418,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         print(f"\n>> POST {self.path}")
+        body = self._parse_body()
+        print(f"   Body keys: {list(body.keys())}")
+        print(f"   stream: {body.get('stream', 'NOT SET')}")
+        print(f"   model: {body.get('model', 'NOT SET')}")
+        if 'input' in body:
+            inp = body['input']
+            if isinstance(inp, list):
+                print(f"   input: {len(inp)} messages, roles: {[m.get('role','?') for m in inp if isinstance(m,dict)]}")
+            else:
+                print(f"   input: {str(inp)[:200]}")
+        if 'messages' in body:
+            print(f"   messages: {len(body['messages'])} messages")
         if self.path == "/v1/chat/completions":
-            body = self._parse_body()
             with _inference_lock:
                 self._handle_chat(body)
         elif self.path == "/v1/responses":
-            body = self._parse_body()
             with _inference_lock:
                 self._handle_responses(body)
         else:
