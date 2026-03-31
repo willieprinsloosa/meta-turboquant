@@ -207,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }],
             })
-        elif self.path == "/health":
+        elif self.path in ("/health", "/v1", "/"):
             self._send_json({"status": "ok", "model": MODEL_NAME})
         else:
             self._send_json({"error": "not found"}, 404)
