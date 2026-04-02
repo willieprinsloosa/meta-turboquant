@@ -109,13 +109,25 @@ The most surprising finding is that 1-bit quantization preserves structured outp
 
 This means the model can function as a genuine agent — not just a chatbot — at 1.3GB.
 
-### 4.2 Privacy and Sovereignty
+### 4.2 No Rate Limits, No 429 Errors
+
+Cloud LLM APIs enforce aggressive rate limits. OpenAI, Anthropic, and others return **HTTP 429 (Too Many Requests)** when you exceed their per-minute token or request quotas. For agent workflows — where a single task may trigger 10-50 sequential tool calls — this is a critical bottleneck:
+
+- A coding agent that reads files, runs tests, and iterates will exhaust rate limits within minutes
+- Multi-agent architectures that run parallel LLM calls hit limits almost immediately
+- Batch processing jobs (summarizing 1000 documents, analyzing datasets) become impractical
+- Retry logic with exponential backoff adds minutes of dead time per 429 error
+
+**The local TurboQuant server has no rate limits.** It processes requests as fast as the hardware allows — approximately 85 tok/s sustained, with zero wait time between requests. A tool-calling loop that would take 10 minutes with cloud API rate limits completes in seconds locally.
+
+This isn't just a convenience — it changes what's architecturally feasible. Agent designs that are impractical with cloud APIs (tight tool-calling loops, parallel sub-agents, brute-force search over solution spaces) become viable when inference is unlimited and local.
+
+### 4.3 Privacy and Sovereignty
 
 Running locally means:
 
 - **No data leaves the device** — conversations, tool results, and documents stay on your Mac
 - **No API costs** — unlimited inference at zero marginal cost
-- **No rate limits** — as fast as your hardware allows
 - **No internet required** — works fully offline after model download
 - **No vendor lock-in** — swap models freely via HuggingFace
 

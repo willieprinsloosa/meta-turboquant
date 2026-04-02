@@ -680,6 +680,20 @@ Make sure you're using a tool-capable model (Bonsai/Qwen). Llama models don't su
 - Use a smaller model (Bonsai 4B or 1.7B)
 - Close other GPU-intensive apps
 
+### 429 Too Many Requests from cloud APIs
+
+If you're hitting rate limits on OpenAI/Anthropic/other cloud APIs, switch to the local TurboQuant server. It has **no rate limits** — requests are processed as fast as hardware allows (~85 tok/s). Just change your `base_url`:
+
+```python
+# Before (cloud, rate-limited)
+client = OpenAI(api_key="sk-...")
+
+# After (local, unlimited)
+client = OpenAI(base_url="http://localhost:11434/v1", api_key="local")
+```
+
+This is especially impactful for agent workflows with tight tool-calling loops, parallel sub-agents, or batch processing — all of which exhaust cloud rate limits quickly.
+
 ### Model download fails
 
 Set a HuggingFace token for faster downloads:
