@@ -10,33 +10,38 @@ Usage:
     python serve.py --strategy v3 --bits 3 --port 8800
 
 Environment:
-    TURBOQUANT_MODEL    — model name (default: mlx-community/Llama-3.2-3B-Instruct-4bit)
-    TURBOQUANT_PORT     — port (default: 11434)
-    TURBOQUANT_STRATEGY — v2 or v3 (default: v2)
-    TURBOQUANT_BITS     — quantization bits (default: 4)
+    TURBOQUANT_MODEL      — model name (default: mlx-community/Llama-3.2-3B-Instruct-4bit)
+    TURBOQUANT_PORT       — port (default: 11434)
+    TURBOQUANT_STRATEGY   — v2 or v3 (default: v2)
+    TURBOQUANT_BITS       — quantization bits (default: 4)
+    TURBOQUANT_LEAN       — set to 1 for LEAN mode (default: 0)
+    TURBOQUANT_GROUP_SIZE — group size (default: 64)
 """
 
 import argparse
 import json
 import os
-import sys
+import re
 import time
+import threading
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-import threading
 
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.generate import generate_step
 
-from turboquant.cache_v2 import TurboQuantKVCacheV2
-from turboquant.cache_v3 import TurboQuantKVCacheV3
+from turboquant.utils import get_head_dim, make_cache
 import turboquant.patch as tq_patch
 
 tq_patch.apply()
 
-# Globals set at startup
+# --- Constants ---
+MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
+LOCK_TIMEOUT = 30  # seconds
+
+# --- Globals set at startup ---
 MODEL = None
 TOKENIZER = None
 MODEL_NAME = ""
@@ -46,25 +51,6 @@ STRATEGY = "v2"
 BITS = 4
 GROUP_SIZE = 64
 LEAN = False
-
-
-def make_cache():
-    """Creates a fresh TurboQuant cache for all layers."""
-    if STRATEGY == "v3":
-        return [
-            TurboQuantKVCacheV3(
-                head_dim=HEAD_DIM, bits=BITS, seed=42 + i,
-            )
-            for i in range(N_LAYERS)
-        ]
-    else:
-        return [
-            TurboQuantKVCacheV2(
-                head_dim=HEAD_DIM, bits=BITS, group_size=GROUP_SIZE,
-                use_rotation=not LEAN, use_normalization=not LEAN, seed=42 + i,
-            )
-            for i in range(N_LAYERS)
-        ]
 
 
 def _make_sampler(temperature=0.7):
@@ -83,9 +69,10 @@ def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None
         template_kwargs["tools"] = tools
     formatted = TOKENIZER.apply_chat_template(messages, **template_kwargs)
     input_ids = mx.array(TOKENIZER.encode(formatted))
-    cache = make_cache()
+    cache = make_cache(N_LAYERS, HEAD_DIM, STRATEGY, BITS, GROUP_SIZE, LEAN)
 
     tokens = []
+    token_buffer = []
     for token, _ in generate_step(
         prompt=input_ids,
         model=MODEL,
@@ -98,19 +85,30 @@ def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None
             break
         tokens.append(tok)
         if stream:
-            yield TOKENIZER.decode([tok])
+            # Buffer tokens and only yield when we have valid UTF-8 (#8)
+            token_buffer.append(tok)
+            text = TOKENIZER.decode(token_buffer)
+            if text and not text.endswith("\ufffd"):
+                yield text
+                token_buffer = []
+
+    # Flush any remaining buffered tokens
+    if stream and token_buffer:
+        text = TOKENIZER.decode(token_buffer)
+        if text:
+            yield text
 
     if not stream:
         yield TOKENIZER.decode(tokens)
 
 
-import re
+# --- Tool call parsing ---
 
 def _parse_tool_calls(text):
     """Parses <tool_call> blocks from model output into OpenAI tool_calls format."""
     tool_calls = []
     pattern = re.compile(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', re.DOTALL)
-    for i, match in enumerate(pattern.finditer(text)):
+    for match in pattern.finditer(text):
         try:
             call = json.loads(match.group(1))
             tool_calls.append({
@@ -131,6 +129,8 @@ def _strip_tool_calls(text):
     cleaned = re.sub(r'<tool_call>\s*\{.*?\}\s*</tool_call>', '', text, flags=re.DOTALL).strip()
     return cleaned if cleaned else None
 
+
+# --- Response formatters ---
 
 def make_response(content, model_name, usage=None, tool_calls=None):
     """Formats an OpenAI-compatible chat completion response."""
@@ -154,11 +154,20 @@ def make_response(content, model_name, usage=None, tool_calls=None):
     }
 
 
-def make_stream_chunk(content, model_name, finish=False):
-    """Formats an OpenAI-compatible streaming chunk."""
-    delta = {} if finish else {"role": "assistant", "content": content}
+def make_stream_chunk(stream_id, model_name, content=None, finish=False, is_first=False):
+    """Formats an OpenAI-compatible streaming chunk.
+
+    Uses consistent stream_id across all chunks (#4).
+    First chunk sends role only, subsequent send content only (#5).
+    """
+    if finish:
+        delta = {}
+    elif is_first:
+        delta = {"role": "assistant", "content": ""}
+    else:
+        delta = {"content": content}
     return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "id": stream_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model_name,
@@ -182,15 +191,19 @@ def make_responses_response(content, model_name):
             "type": "message",
             "id": f"msg-{uuid.uuid4().hex[:12]}",
             "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": content,
-            }],
+            "content": [{"type": "output_text", "text": content}],
             "status": "completed",
         }],
         "status": "completed",
     }
 
+
+def _tok_per_sec(tokens, elapsed):
+    """Safe tokens/second calculation (#3)."""
+    return f"{tokens / max(elapsed, 1e-9):.0f}"
+
+
+# --- HTTP Server ---
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle each request in a new thread so health checks don't block."""
@@ -248,8 +261,81 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
     def _parse_body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length))
+        """Parse JSON body with error handling (#2) and size limit (#9)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length == 0:
+                return None
+            if length > MAX_BODY_SIZE:
+                return None
+            raw = self.rfile.read(length)
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _stream_response(self, messages, max_tokens, temperature, model_id, tools=None):
+        """Shared streaming logic for chat and responses endpoints.
+
+        Handles BrokenPipeError (#1), consistent chunk IDs (#4),
+        proper role delta (#5), and forces non-streaming for tool calls (#6).
+        """
+        # Force non-streaming when tools are present (#6)
+        if tools:
+            return self._non_stream_response(messages, max_tokens, temperature, model_id, tools)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        stream_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+        try:
+            # First chunk: role only (#5)
+            first = make_stream_chunk(stream_id, model_id, is_first=True)
+            self.wfile.write(f"data: {json.dumps(first)}\n\n".encode())
+            self.wfile.flush()
+
+            for chunk_text in generate(messages, max_tokens, temperature, stream=True, tools=None):
+                chunk = make_stream_chunk(stream_id, model_id, content=chunk_text)
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+
+            final = make_stream_chunk(stream_id, model_id, finish=True)
+            self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            print("  [client disconnected]")
+
+    def _non_stream_response(self, messages, max_tokens, temperature, model_id, tools=None):
+        """Non-streaming response with tool call parsing."""
+        full_text = next(generate(messages, max_tokens, temperature, stream=False, tools=tools))
+        elapsed = time.perf_counter() - self._request_start
+
+        tool_calls = _parse_tool_calls(full_text) if tools else []
+
+        template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if tools:
+            template_kwargs["tools"] = tools
+        prompt_tokens = len(TOKENIZER.encode(
+            TOKENIZER.apply_chat_template(messages, **template_kwargs)
+        ))
+        completion_tokens = len(TOKENIZER.encode(full_text))
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        response = make_response(full_text, model_id, usage, tool_calls or None)
+        self._send_json(response)
+        if tool_calls:
+            names = [tc["function"]["name"] for tc in tool_calls]
+            print(f"  [tool_calls: {names}, {elapsed:.1f}s]")
+        else:
+            print(f"  [{completion_tokens} tokens, {elapsed:.1f}s, {_tok_per_sec(completion_tokens, elapsed)} tok/s]")
 
     def _handle_chat(self, body):
         """Handles /v1/chat/completions requests."""
@@ -264,66 +350,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         model_id = body.get("model", MODEL_NAME)
-        start = time.perf_counter()
+        self._request_start = time.perf_counter()
 
         if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-
-            for chunk_text in generate(messages, max_tokens, temperature, stream=True, tools=tools):
-                chunk = make_stream_chunk(chunk_text, model_id)
-                line = f"data: {json.dumps(chunk)}\n\n"
-                self.wfile.write(line.encode())
-                self.wfile.flush()
-
-            final = make_stream_chunk("", model_id, finish=True)
-            self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            self._stream_response(messages, max_tokens, temperature, model_id, tools)
         else:
-            full_text = ""
-            for text in generate(messages, max_tokens, temperature, stream=False, tools=tools):
-                full_text = text
-
-            elapsed = time.perf_counter() - start
-
-            # Parse tool calls from model output
-            tool_calls = _parse_tool_calls(full_text) if tools else []
-
-            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-            if tools:
-                template_kwargs["tools"] = tools
-            prompt_tokens = len(TOKENIZER.encode(
-                TOKENIZER.apply_chat_template(messages, **template_kwargs)
-            ))
-            completion_tokens = len(TOKENIZER.encode(full_text))
-            usage = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }
-            response = make_response(full_text, model_id, usage, tool_calls or None)
-            self._send_json(response)
-            if tool_calls:
-                names = [tc["function"]["name"] for tc in tool_calls]
-                print(f"  [tool_calls: {names}, {elapsed:.1f}s]")
-            else:
-                print(f"  [{completion_tokens} tokens, {elapsed:.1f}s, {completion_tokens/elapsed:.0f} tok/s]")
+            self._non_stream_response(messages, max_tokens, temperature, model_id, tools)
 
     def _handle_responses(self, body):
         """Handles /v1/responses requests (OpenAI Responses API)."""
-        # The Responses API uses 'input' (string or messages array)
         input_data = body.get("input", "")
         max_tokens = body.get("max_output_tokens", body.get("max_tokens", 512))
         temperature = body.get("temperature", 0.7)
         model_id = body.get("model", MODEL_NAME)
         stream = body.get("stream", False)
 
-        # Convert input to messages format
-        # Map roles: "developer" -> "system" (Atomic Chat / OpenAI convention)
         def _map_role(role):
             return "system" if role == "developer" else role
 
@@ -335,7 +376,6 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(item, dict) and "role" in item:
                     role = _map_role(item["role"])
                     content = item.get("content", "")
-                    # Content can be a string or list of content blocks
                     if isinstance(content, list):
                         text_parts = []
                         for block in content:
@@ -364,74 +404,58 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "input required"}, 400)
             return
 
-        start = time.perf_counter()
+        self._request_start = time.perf_counter()
 
         if stream:
-            # Use chat completions streaming format — widely supported by clients
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-
-            for chunk_text in generate(messages, max_tokens, temperature, stream=True):
-                chunk = make_stream_chunk(chunk_text, model_id)
-                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-                self.wfile.flush()
-
-            final = make_stream_chunk("", model_id, finish=True)
-            self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-
-            elapsed = time.perf_counter() - start
-            print(f"  [responses stream] [{elapsed:.1f}s]")
+            self._stream_response(messages, max_tokens, temperature, model_id)
         else:
-            full_text = ""
-            for text in generate(messages, max_tokens, temperature, stream=False):
-                full_text = text
-
-            elapsed = time.perf_counter() - start
+            full_text = next(generate(messages, max_tokens, temperature, stream=False))
+            elapsed = time.perf_counter() - self._request_start
             response = make_responses_response(full_text, model_id)
             self._send_json(response)
             tok_count = len(TOKENIZER.encode(full_text))
-            print(f"  [responses] [{tok_count} tokens, {elapsed:.1f}s, {tok_count/elapsed:.0f} tok/s]")
+            print(f"  [responses] [{tok_count} tokens, {elapsed:.1f}s, {_tok_per_sec(tok_count, elapsed)} tok/s]")
 
     def do_POST(self):
         print(f"\n>> POST {self.path}")
         body = self._parse_body()
-        print(f"   Body keys: {list(body.keys())}")
-        print(f"   stream: {body.get('stream', 'NOT SET')}")
-        print(f"   model: {body.get('model', 'NOT SET')}")
-        if 'input' in body:
-            inp = body['input']
-            if isinstance(inp, list):
-                print(f"   input: {len(inp)} messages, roles: {[m.get('role','?') for m in inp if isinstance(m,dict)]}")
-            else:
-                print(f"   input: {str(inp)[:200]}")
-        if 'messages' in body:
-            print(f"   messages: {len(body['messages'])} messages")
-        if self.path == "/v1/chat/completions":
-            with _inference_lock:
-                self._handle_chat(body)
-        elif self.path == "/v1/responses":
-            with _inference_lock:
-                self._handle_responses(body)
-        else:
+
+        # (#2) Handle malformed/oversized requests
+        if body is None:
+            self._send_json({"error": "invalid or missing JSON body"}, 400)
+            return
+
+        print(f"   stream: {body.get('stream', 'NOT SET')}, model: {body.get('model', 'NOT SET')}")
+
+        if self.path not in ("/v1/chat/completions", "/v1/responses"):
             self._send_json({"error": "not found"}, 404)
+            return
+
+        # (#7) Lock with timeout — return 503 if busy
+        if not _inference_lock.acquire(timeout=LOCK_TIMEOUT):
+            self._send_json({"error": "server busy, try again later"}, 503)
+            return
+        try:
+            if self.path == "/v1/chat/completions":
+                self._handle_chat(body)
+            else:
+                self._handle_responses(body)
+        finally:
+            _inference_lock.release()
 
 
 def main():
-    global MODEL, TOKENIZER, MODEL_NAME, HEAD_DIM, N_LAYERS, STRATEGY, BITS, GROUP_SIZE
+    global MODEL, TOKENIZER, MODEL_NAME, HEAD_DIM, N_LAYERS, STRATEGY, BITS, GROUP_SIZE, LEAN
 
     parser = argparse.ArgumentParser(description="TurboQuant Local LLM Server")
     parser.add_argument("--model", default=os.environ.get("TURBOQUANT_MODEL", "mlx-community/Llama-3.2-3B-Instruct-4bit"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("TURBOQUANT_PORT", "11434")))
     parser.add_argument("--strategy", default=os.environ.get("TURBOQUANT_STRATEGY", "v2"), choices=["v2", "v3"])
     parser.add_argument("--bits", type=int, default=int(os.environ.get("TURBOQUANT_BITS", "4")), choices=[2, 3, 4])
-    parser.add_argument("--group-size", type=int, default=64)
-    parser.add_argument("--lean", action="store_true", help="LEAN mode: no rotation, maximum speed")
+    parser.add_argument("--group-size", type=int, default=int(os.environ.get("TURBOQUANT_GROUP_SIZE", "64")))
+    parser.add_argument("--lean", action="store_true",
+                        default=os.environ.get("TURBOQUANT_LEAN", "0") == "1",
+                        help="LEAN mode: no rotation, maximum speed")
     args = parser.parse_args()
 
     MODEL_NAME = args.model
@@ -442,11 +466,7 @@ def main():
 
     print(f"Loading model: {MODEL_NAME}")
     MODEL, TOKENIZER = mlx_lm.load(MODEL_NAME)
-    attn = MODEL.layers[0].self_attn
-    HEAD_DIM = getattr(attn, 'head_dim', None)
-    if HEAD_DIM is None:
-        hidden = getattr(MODEL.args, 'hidden_size', getattr(MODEL.args, 'model_dim', 0))
-        HEAD_DIM = hidden // attn.n_heads if hidden else 128
+    HEAD_DIM = get_head_dim(MODEL)
     N_LAYERS = len(MODEL.layers)
     print(f"  {N_LAYERS} layers, head_dim={HEAD_DIM}")
     mode = "LEAN" if LEAN else "rotated"
@@ -454,7 +474,7 @@ def main():
 
     # Warmup
     print("Warming up...")
-    cache = make_cache()
+    cache = make_cache(N_LAYERS, HEAD_DIM, STRATEGY, BITS, GROUP_SIZE, LEAN)
     warmup_ids = mx.array(TOKENIZER.encode("Hello"))
     for tok, _ in generate_step(prompt=warmup_ids, model=MODEL, max_tokens=1, prompt_cache=cache):
         break
@@ -463,6 +483,7 @@ def main():
     server = ThreadedHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"\nServing on http://localhost:{args.port}")
     print(f"  POST /v1/chat/completions  — OpenAI-compatible chat")
+    print(f"  POST /v1/responses         — OpenAI Responses API")
     print(f"  GET  /v1/models            — list models")
     print(f"  GET  /health               — health check")
     print(f"\nOpenClaw config:")

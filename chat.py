@@ -11,44 +11,33 @@ Usage:
 """
 
 import argparse
-import sys
 import time
 
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.generate import generate_step
 
-from turboquant.cache_v2 import TurboQuantKVCacheV2
-from turboquant.cache_v3 import TurboQuantKVCacheV3
+from turboquant.utils import get_head_dim, make_cache
 import turboquant.patch as tq_patch
 
 tq_patch.apply()
 
-
-def _get_head_dim(model):
-    attn = model.layers[0].self_attn
-    hd = getattr(attn, 'head_dim', None)
-    if hd is None:
-        hidden = getattr(model.args, 'hidden_size', getattr(model.args, 'model_dim', 0))
-        hd = hidden // attn.n_heads if hidden else 128
-    return hd
+# Maximum prompt tokens before trimming history (#14)
+MAX_PROMPT_TOKENS = 4096
 
 
-def make_cache(model, strategy="v2", bits=4, group_size=64, lean=False):
-    head_dim = _get_head_dim(model)
-    n_layers = len(model.layers)
-    if strategy == "v3":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=bits, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    return [
-        TurboQuantKVCacheV2(
-            head_dim=head_dim, bits=bits, group_size=group_size,
-            use_rotation=not lean, use_normalization=not lean, seed=42 + i,
+def _trim_history(history, tokenizer, max_tokens, has_system):
+    """Trims oldest messages (keeping system prompt) to fit context window."""
+    while len(history) > (2 if has_system else 1):
+        formatted = tokenizer.apply_chat_template(
+            history, tokenize=False, add_generation_prompt=True
         )
-        for i in range(n_layers)
-    ]
+        if len(tokenizer.encode(formatted)) <= max_tokens:
+            break
+        # Remove oldest non-system message
+        start = 1 if has_system else 0
+        history.pop(start)
+    return history
 
 
 def main():
@@ -64,7 +53,7 @@ def main():
 
     print(f"Loading {args.model}...")
     model, tokenizer = mlx_lm.load(args.model)
-    head_dim = _get_head_dim(model)
+    head_dim = get_head_dim(model)
     n_layers = len(model.layers)
     mode = "LEAN" if args.lean else "rotated"
     print(f"  {n_layers} layers, head_dim={head_dim}")
@@ -72,8 +61,15 @@ def main():
     print("Type your message. Press Ctrl+C to quit.\n")
 
     history = []
+    has_system = False
     if args.system:
         history.append({"role": "system", "content": args.system})
+        has_system = True
+
+    # Cumulative stats for /stats command (#13)
+    total_tokens = 0
+    total_time = 0.0
+    turn_count = 0
 
     while True:
         try:
@@ -85,35 +81,52 @@ def main():
         if not user_input.strip():
             continue
 
-        if user_input.strip().lower() in ("/quit", "/exit", "/q"):
+        cmd = user_input.strip().lower()
+        if cmd in ("/quit", "/exit", "/q"):
             print("Bye!")
             break
 
-        if user_input.strip().lower() == "/clear":
-            history = history[:1] if args.system else []
-            print("  (history cleared)\n")
+        if cmd == "/clear":
+            history = history[:1] if has_system else []
+            total_tokens = 0
+            total_time = 0.0
+            turn_count = 0
+            print("  (history and stats cleared)\n")
             continue
 
-        if user_input.strip().lower() == "/help":
-            print("  /clear  — clear conversation history")
+        if cmd == "/stats":
+            avg_tps = total_tokens / max(total_time, 1e-9)
+            print(f"  Turns: {turn_count}")
+            print(f"  Total tokens: {total_tokens}")
+            print(f"  Total time: {total_time:.1f}s")
+            print(f"  Average: {avg_tps:.0f} tok/s")
+            print(f"  History: {len(history)} messages")
+            print()
+            continue
+
+        if cmd == "/help":
+            print("  /clear  — clear conversation history and stats")
+            print("  /stats  — show session statistics")
             print("  /quit   — exit")
-            print("  /stats  — show cache stats")
             print()
             continue
 
         history.append({"role": "user", "content": user_input})
 
-        # Build new cache each turn (stateless — simpler and avoids KV drift)
-        cache = make_cache(model, args.strategy, args.bits, args.group_size, args.lean)
+        # Trim history if too long (#14)
+        history = _trim_history(history, tokenizer, MAX_PROMPT_TOKENS, has_system)
+
+        cache = make_cache(n_layers, head_dim, args.strategy, args.bits, args.group_size, args.lean)
 
         formatted = tokenizer.apply_chat_template(
             history, tokenize=False, add_generation_prompt=True
         )
         input_ids = mx.array(tokenizer.encode(formatted))
 
-        # Generate with streaming output
+        # Generate with streaming output, buffering for UTF-8 (#8)
         print("\033[1;32mAssistant:\033[0m ", end="", flush=True)
         tokens = []
+        token_buffer = []
         start = time.perf_counter()
 
         for token, _ in generate_step(
@@ -124,17 +137,33 @@ def main():
             if tok == tokenizer.eos_token_id:
                 break
             tokens.append(tok)
-            print(tokenizer.decode([tok]), end="", flush=True)
+            token_buffer.append(tok)
+            text = tokenizer.decode(token_buffer)
+            if text and not text.endswith("\ufffd"):
+                print(text, end="", flush=True)
+                token_buffer = []
+
+        # Flush remaining buffer
+        if token_buffer:
+            text = tokenizer.decode(token_buffer)
+            if text:
+                print(text, end="", flush=True)
 
         elapsed = time.perf_counter() - start
         response_text = tokenizer.decode(tokens)
         history.append({"role": "assistant", "content": response_text})
 
-        # Stats
+        # Update cumulative stats
+        total_tokens += len(tokens)
+        total_time += elapsed
+        turn_count += 1
+
+        # Per-turn stats (#3 — guard division by zero)
         cache_bytes = sum(c.nbytes for c in cache)
         fp16_bytes = sum(c.nbytes_equivalent_fp16 for c in cache)
         ratio = fp16_bytes / cache_bytes if cache_bytes > 0 else 0
-        print(f"\n\033[2m  [{len(tokens)} tokens, {elapsed:.1f}s, {len(tokens)/elapsed:.0f} tok/s, "
+        tps = len(tokens) / max(elapsed, 1e-9)
+        print(f"\n\033[2m  [{len(tokens)} tokens, {elapsed:.1f}s, {tps:.0f} tok/s, "
               f"cache: {cache_bytes/1024:.0f}KB, {ratio:.1f}x compression]\033[0m\n")
 
 
