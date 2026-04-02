@@ -14,7 +14,7 @@ Reproduction of KV-Cache quantization from [TurboQuant (Google, 2025)](https://r
 
 ## Installation
 
-### Option 1: pip install (recommended)
+### Standard models (Llama, Mistral, Qwen, etc.)
 
 ```bash
 # Create a virtual environment with arm64 Python
@@ -23,46 +23,106 @@ source .venv/bin/activate
 
 # Install the package and dependencies
 pip install -e .
-```
 
-### Option 2: Install dependencies only
-
-```bash
-pip install mlx mlx-lm numpy
-
-# Verify MLX works on your hardware
-python -c "import mlx.core as mx; print(mx.default_device())"
-# Should print: Device(gpu, 0)
-```
-
-### Verify installation
-
-```bash
-# Run the test suite (52 tests)
-pip install pytest
+# Verify
 python -m pytest tests/ -v
-
-# Quick demo — generates text with compressed KV-cache
 python run_llm.py
 ```
+
+### Bonsai 1-bit models (requires Python 3.13 + PrismML MLX fork)
+
+[Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models use 1-bit quantization (1.25 bits/weight), giving 8B parameters in just 1.3GB. They require a custom MLX build:
+
+```bash
+# Install Metal Toolchain (needed to compile PrismML MLX fork)
+xcodebuild -downloadComponent MetalToolchain
+
+# Create Python 3.13 venv (PrismML builds for 3.13)
+python3.13 -m venv .venv13
+source .venv13/bin/activate
+
+# Install PrismML MLX fork with 1-bit kernel support
+pip install mlx@git+https://github.com/PrismML-Eng/mlx.git@prism mlx-lm numpy
+
+# Verify
+python -c "import mlx.core as mx; mx.quantize(mx.ones((1,128)), bits=1, group_size=128); print('1-bit OK')"
+```
+
+### Available Bonsai models
+
+| Model | Size | Memory | Speed |
+|-------|------|--------|-------|
+| `prism-ml/Bonsai-8B-mlx-1bit` | 8B params | 1.3 GB | ~90 tok/s |
+| `prism-ml/Bonsai-4B-mlx-1bit` | 4B params | 0.7 GB | ~120 tok/s |
+| `prism-ml/Bonsai-1.7B-mlx-1bit` | 1.7B params | 80 MB | ~200 tok/s |
+
+All Bonsai models support **tool calling** (Qwen3 architecture).
 
 > **Note:** If `pip install mlx` fails with "No matching distribution found", your Python is likely running under Rosetta (x86_64). Check with `python3 -c "import platform; print(platform.machine())"` — it must print `arm64`. Use `/opt/homebrew/bin/python3` or install an arm64 Python via Homebrew.
 
 ## Quick Start
 
 ```bash
+# Interactive chat (streams tokens, multi-turn, shows stats)
+python chat.py --lean
+
+# Chat with Bonsai 8B (1-bit, 1.3GB, 90 tok/s)
+python chat.py --lean --model prism-ml/Bonsai-8B-mlx-1bit  # requires .venv13
+
+# Start OpenAI-compatible server
+python serve.py --lean
+
+# Server with Bonsai 8B + tool calling
+python serve.py --lean --model prism-ml/Bonsai-8B-mlx-1bit  # requires .venv13
+
 # Demo: text generation with compressed KV cache
 python run_llm.py
 
-# Benchmark: speed + quality + perplexity
-python benchmark.py
-
-# Long-context benchmark: throughput at 512-8192 tokens
-python benchmark_longseq.py
-
-# Multi-model benchmark: PPL across 4 models
-python benchmark_models.py
+# Benchmarks
+python benchmark.py              # speed + quality + perplexity
+python benchmark_longseq.py      # throughput at 512-8192 tokens
+python benchmark_models.py       # PPL across 4 models
 ```
+
+## Interactive Chat
+
+A terminal chat app with streaming output, multi-turn conversation, and per-turn compression stats.
+
+```bash
+python chat.py --lean
+```
+
+```
+You: What is the meaning of life?
+Assistant: The meaning of life is a deeply personal question...
+  [499 tokens, 6.5s, 77 tok/s, cache: 21020KB, 3.6x compression]
+
+You: Write a haiku about that
+Assistant: Purpose unfolds slow
+  Through connections, joy, and growth—
+  Life's meaning: to live.
+  [18 tokens, 0.6s, 35 tok/s, cache: 22340KB, 3.6x compression]
+```
+
+### Options
+
+```bash
+python chat.py                                          # V2 4-bit rotated (default)
+python chat.py --lean                                   # V2 4-bit LEAN (fastest)
+python chat.py --bits 3                                 # V2 3-bit (more compression)
+python chat.py --strategy v3 --bits 3                   # V3 3-bit (best quality)
+python chat.py --model mlx-community/Llama-3.1-8B-Instruct-4bit  # different model
+python chat.py --system "You are a pirate"              # custom system prompt
+python chat.py --max-tokens 1024                        # longer responses
+```
+
+### Commands
+
+| Command | Action |
+|---------|--------|
+| `/clear` | Clear conversation history |
+| `/quit` | Exit |
+| `/help` | Show commands |
 
 ### Use in your own code
 
@@ -117,10 +177,13 @@ Meta-TurboQuant includes an **OpenAI-compatible HTTP server** that serves local 
 source .venv/bin/activate
 
 # Default: Llama 3.2 3B with V2 4-bit compression
-python serve.py
+python serve.py --lean
+
+# Bonsai 8B with tool calling (requires .venv13)
+python serve.py --lean --model prism-ml/Bonsai-8B-mlx-1bit
 
 # Larger model (still fits 16GB Mac)
-python serve.py --model mlx-community/Llama-3.1-8B-Instruct-4bit
+python serve.py --lean --model mlx-community/Llama-3.1-8B-Instruct-4bit
 
 # More compression (3-bit, 3.8x savings)
 python serve.py --bits 3
@@ -160,6 +223,66 @@ curl http://localhost:11434/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":true}'
 ```
 
+### Tool calling (function calling)
+
+The server supports OpenAI-compatible tool calling. Models based on Qwen3 (like Bonsai) have native tool support. Pass `tools` in your request and the server will parse `<tool_call>` blocks from model output into the standard `tool_calls` response format.
+
+```bash
+# Step 1: Send a request with tools
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }]
+  }'
+
+# Response includes tool_calls:
+# {
+#   "choices": [{
+#     "message": {
+#       "role": "assistant",
+#       "tool_calls": [{
+#         "id": "call_879e2240",
+#         "type": "function",
+#         "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}
+#       }]
+#     },
+#     "finish_reason": "tool_calls"
+#   }]
+# }
+
+# Step 2: Send the tool result back
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "What is the weather in Tokyo?"},
+      {"role": "assistant", "content": null, "tool_calls": [{"id": "call_879e2240", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}]},
+      {"role": "tool", "tool_call_id": "call_879e2240", "content": "{\"temp\": 22, \"condition\": \"sunny\"}"}
+    ],
+    "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+  }'
+
+# Response: "The weather in Tokyo is sunny with a temperature of 22°C."
+```
+
+**Compatible models for tool calling:**
+- `prism-ml/Bonsai-8B-mlx-1bit` — 1.3GB, 90 tok/s, Qwen3 architecture
+- `prism-ml/Bonsai-4B-mlx-1bit` — 0.7GB, ~120 tok/s
+- `mlx-community/Qwen2.5-7B-Instruct-4bit` — 4.5GB
+- Any model with `<tool_call>` support in its chat template
+
 ### Environment variables
 
 | Variable | Default | Description |
@@ -171,13 +294,16 @@ curl http://localhost:11434/v1/chat/completions \
 
 ### Recommended models for 16GB Mac
 
-| Model | Size | Best for |
-|-------|------|----------|
-| `mlx-community/Llama-3.2-1B-Instruct-4bit` | ~0.7 GB | Fastest, lightweight tasks |
-| `mlx-community/Llama-3.2-3B-Instruct-4bit` | ~1.8 GB | Good balance (default) |
-| `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | ~4.5 GB | Strong 7B quality |
-| `mlx-community/Llama-3.1-8B-Instruct-4bit` | ~4.5 GB | Best quality at 8B |
-| `mlx-community/Qwen2.5-7B-Instruct-4bit` | ~4.5 GB | Strong multilingual |
+| Model | Size | Speed | Tools | Best for |
+|-------|------|-------|:-----:|----------|
+| `prism-ml/Bonsai-8B-mlx-1bit` | 1.3 GB | ~90 tok/s | Yes | Best value — 8B quality in 1.3GB, tool calling |
+| `prism-ml/Bonsai-4B-mlx-1bit` | 0.7 GB | ~120 tok/s | Yes | Ultra-fast with tool calling |
+| `prism-ml/Bonsai-1.7B-mlx-1bit` | 80 MB | ~200 tok/s | Yes | Tiny, edge devices |
+| `mlx-community/Llama-3.2-3B-Instruct-4bit` | 1.8 GB | ~85 tok/s | No | Good balance (default) |
+| `mlx-community/Llama-3.1-8B-Instruct-4bit` | 4.5 GB | ~50 tok/s | No | Best 4-bit quality |
+| `mlx-community/Qwen2.5-7B-Instruct-4bit` | 4.5 GB | ~50 tok/s | Yes | Multilingual + tools |
+
+Bonsai models require the `.venv13` environment (Python 3.13 + PrismML MLX fork). See [Installation](#installation).
 
 With TurboQuant V2 4-bit compression, an 8B model on 16GB can handle ~32K context tokens.
 
@@ -230,8 +356,11 @@ This teaches OpenClaw when and how to use your local TurboQuant model.
 - V1 legacy code deprecated with warnings, lazy-loaded
 - State setter raises `NotImplementedError` instead of silently dropping data
 - Fixed hardcoded baseline PPL in experiment_2bit.py
-- Added `serve.py` — OpenAI-compatible local LLM server with `/v1/chat/completions` and `/v1/responses`
+- Added `serve.py` — OpenAI-compatible local LLM server with `/v1/chat/completions`, `/v1/responses`, streaming, and tool calling
+- Added `chat.py` — interactive terminal chat with streaming output and compression stats
 - Added OpenClaw skill for local inference integration
+- Added Bonsai 1-bit model support (PrismML MLX fork, Python 3.13)
+- Added tool calling support — parses `<tool_call>` blocks into OpenAI `tool_calls` format
 
 ## Benchmark Results
 
@@ -409,8 +538,9 @@ turboquant/
 ├── attention.py         # V1: attention (legacy)
 └── attention_fused.py   # V1: fused attention (legacy)
 
-serve.py                 # OpenAI-compatible local LLM server
-run_llm.py               # Interactive demo
+serve.py                 # OpenAI-compatible server (chat, responses, tool calling)
+chat.py                  # Interactive terminal chat with streaming
+run_llm.py               # Quick demo
 benchmark.py             # Speed + quality benchmark
 benchmark_common.py      # Shared eval text and perplexity computation
 benchmark_longseq.py     # Long-context throughput benchmark
