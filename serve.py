@@ -76,11 +76,12 @@ def _make_sampler(temperature=0.7):
     return sampler
 
 
-def generate(messages, max_tokens=512, temperature=0.7, stream=False):
+def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None):
     """Generates a response from chat messages."""
-    formatted = TOKENIZER.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if tools:
+        template_kwargs["tools"] = tools
+    formatted = TOKENIZER.apply_chat_template(messages, **template_kwargs)
     input_ids = mx.array(TOKENIZER.encode(formatted))
     cache = make_cache()
 
@@ -103,8 +104,42 @@ def generate(messages, max_tokens=512, temperature=0.7, stream=False):
         yield TOKENIZER.decode(tokens)
 
 
-def make_response(content, model_name, usage=None):
+import re
+
+def _parse_tool_calls(text):
+    """Parses <tool_call> blocks from model output into OpenAI tool_calls format."""
+    tool_calls = []
+    pattern = re.compile(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', re.DOTALL)
+    for i, match in enumerate(pattern.finditer(text)):
+        try:
+            call = json.loads(match.group(1))
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": call.get("name", ""),
+                    "arguments": json.dumps(call.get("arguments", {})),
+                },
+            })
+        except json.JSONDecodeError:
+            continue
+    return tool_calls
+
+
+def _strip_tool_calls(text):
+    """Removes <tool_call> blocks from text, returns remaining content."""
+    cleaned = re.sub(r'<tool_call>\s*\{.*?\}\s*</tool_call>', '', text, flags=re.DOTALL).strip()
+    return cleaned if cleaned else None
+
+
+def make_response(content, model_name, usage=None, tool_calls=None):
     """Formats an OpenAI-compatible chat completion response."""
+    message = {"role": "assistant", "content": content}
+    finish_reason = "stop"
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        message["content"] = _strip_tool_calls(content) if content else None
+        finish_reason = "tool_calls"
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -112,8 +147,8 @@ def make_response(content, model_name, usage=None):
         "model": model_name,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
@@ -222,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
         max_tokens = body.get("max_tokens", 512)
         temperature = body.get("temperature", 0.7)
         stream = body.get("stream", False)
+        tools = body.get("tools", None)
 
         if not messages:
             self._send_json({"error": "messages required"}, 400)
@@ -237,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            for chunk_text in generate(messages, max_tokens, temperature, stream=True):
+            for chunk_text in generate(messages, max_tokens, temperature, stream=True, tools=tools):
                 chunk = make_stream_chunk(chunk_text, model_id)
                 line = f"data: {json.dumps(chunk)}\n\n"
                 self.wfile.write(line.encode())
@@ -249,12 +285,19 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         else:
             full_text = ""
-            for text in generate(messages, max_tokens, temperature, stream=False):
+            for text in generate(messages, max_tokens, temperature, stream=False, tools=tools):
                 full_text = text
 
             elapsed = time.perf_counter() - start
+
+            # Parse tool calls from model output
+            tool_calls = _parse_tool_calls(full_text) if tools else []
+
+            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+            if tools:
+                template_kwargs["tools"] = tools
             prompt_tokens = len(TOKENIZER.encode(
-                TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                TOKENIZER.apply_chat_template(messages, **template_kwargs)
             ))
             completion_tokens = len(TOKENIZER.encode(full_text))
             usage = {
@@ -262,9 +305,13 @@ class Handler(BaseHTTPRequestHandler):
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
             }
-            response = make_response(full_text, model_id, usage)
+            response = make_response(full_text, model_id, usage, tool_calls or None)
             self._send_json(response)
-            print(f"  [{completion_tokens} tokens, {elapsed:.1f}s, {completion_tokens/elapsed:.0f} tok/s]")
+            if tool_calls:
+                names = [tc["function"]["name"] for tc in tool_calls]
+                print(f"  [tool_calls: {names}, {elapsed:.1f}s]")
+            else:
+                print(f"  [{completion_tokens} tokens, {elapsed:.1f}s, {completion_tokens/elapsed:.0f} tok/s]")
 
     def _handle_responses(self, body):
         """Handles /v1/responses requests (OpenAI Responses API)."""
