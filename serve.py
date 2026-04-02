@@ -395,7 +395,11 @@ def main():
 
     print(f"Loading model: {MODEL_NAME}")
     MODEL, TOKENIZER = mlx_lm.load(MODEL_NAME)
-    HEAD_DIM = MODEL.layers[0].self_attn.head_dim
+    attn = MODEL.layers[0].self_attn
+    HEAD_DIM = getattr(attn, 'head_dim', None)
+    if HEAD_DIM is None:
+        hidden = getattr(MODEL.args, 'hidden_size', getattr(MODEL.args, 'model_dim', 0))
+        HEAD_DIM = hidden // attn.n_heads if hidden else 128
     N_LAYERS = len(MODEL.layers)
     print(f"  {N_LAYERS} layers, head_dim={HEAD_DIM}")
     mode = "LEAN" if LEAN else "rotated"

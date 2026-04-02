@@ -25,8 +25,17 @@ import turboquant.patch as tq_patch
 tq_patch.apply()
 
 
+def _get_head_dim(model):
+    attn = model.layers[0].self_attn
+    hd = getattr(attn, 'head_dim', None)
+    if hd is None:
+        hidden = getattr(model.args, 'hidden_size', getattr(model.args, 'model_dim', 0))
+        hd = hidden // attn.n_heads if hidden else 128
+    return hd
+
+
 def make_cache(model, strategy="v2", bits=4, group_size=64, lean=False):
-    head_dim = model.layers[0].self_attn.head_dim
+    head_dim = _get_head_dim(model)
     n_layers = len(model.layers)
     if strategy == "v3":
         return [
@@ -55,7 +64,7 @@ def main():
 
     print(f"Loading {args.model}...")
     model, tokenizer = mlx_lm.load(args.model)
-    head_dim = model.layers[0].self_attn.head_dim
+    head_dim = _get_head_dim(model)
     n_layers = len(model.layers)
     mode = "LEAN" if args.lean else "rotated"
     print(f"  {n_layers} layers, head_dim={head_dim}")
