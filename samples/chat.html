@@ -16,10 +16,29 @@ header .model { font-size: 12px; color: #888; margin-left: auto; }
 
 #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
 
-.msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
-.msg.user { align-self: flex-end; background: #0f3460; color: #fff; border-bottom-right-radius: 4px; }
+.msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 14px; word-wrap: break-word; }
+.msg.user { align-self: flex-end; background: #0f3460; color: #fff; border-bottom-right-radius: 4px; white-space: pre-wrap; }
 .msg.assistant { align-self: flex-start; background: #222; color: #e0e0e0; border-bottom-left-radius: 4px; }
 .msg.assistant .label { font-size: 11px; color: #e94560; margin-bottom: 4px; font-weight: 600; }
+.msg.assistant .content h1, .msg.assistant .content h2, .msg.assistant .content h3 { color: #e94560; margin: 12px 0 6px 0; }
+.msg.assistant .content h1 { font-size: 18px; }
+.msg.assistant .content h2 { font-size: 16px; }
+.msg.assistant .content h3 { font-size: 14px; }
+.msg.assistant .content p { margin: 6px 0; }
+.msg.assistant .content ul, .msg.assistant .content ol { margin: 6px 0; padding-left: 20px; }
+.msg.assistant .content li { margin: 3px 0; }
+.msg.assistant .content code { background: #333; padding: 1px 5px; border-radius: 3px; font-family: 'SF Mono', 'Menlo', monospace; font-size: 13px; }
+.msg.assistant .content pre { background: #111; padding: 10px; border-radius: 6px; margin: 8px 0; overflow-x: auto; }
+.msg.assistant .content pre code { background: none; padding: 0; display: block; }
+.msg.assistant .content blockquote { border-left: 3px solid #e94560; padding-left: 10px; margin: 8px 0; color: #aaa; }
+.msg.assistant .content table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+.msg.assistant .content th, .msg.assistant .content td { border: 1px solid #333; padding: 4px 8px; text-align: left; }
+.msg.assistant .content th { background: #1a1a2e; color: #e94560; }
+.msg.assistant .content a { color: #4a7aff; text-decoration: none; }
+.msg.assistant .content a:hover { text-decoration: underline; }
+.msg.assistant .content hr { border: none; border-top: 1px solid #333; margin: 10px 0; }
+.msg.assistant .content strong { color: #fff; }
+.msg.assistant .content em { color: #ccc; }
 .msg.tool-call { align-self: flex-start; background: #1a2744; border: 1px solid #0f3460; color: #4ecca3; font-size: 13px; max-width: 90%; }
 .msg.tool-call .tool-label { font-size: 11px; color: #e94560; margin-bottom: 4px; font-weight: 600; }
 .msg.tool-call .tool-name { color: #4ecca3; font-weight: 600; }
@@ -72,7 +91,16 @@ header .model { font-size: 12px; color: #888; margin-left: auto; }
   <button id="send" onclick="sendMessage()">Send</button>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
+// Configure marked for safe rendering
+marked.setOptions({ breaks: true, gfm: true });
+
+function renderMarkdown(text) {
+  try { return marked.parse(text); }
+  catch { return text; }
+}
+
 const API = 'http://localhost:11434/v1';
 let messages = [];
 let generating = false;
@@ -166,7 +194,10 @@ function addMessage(role, content, stats) {
   div.className = `msg ${role}`;
   if (role === 'assistant') {
     div.innerHTML = `<div class="label">Assistant</div><div class="content"></div>`;
-    div.querySelector('.content').textContent = content || '';
+    const contentEl = div.querySelector('.content');
+    if (content) {
+      contentEl.innerHTML = renderMarkdown(content);
+    }
   } else if (role === 'system') {
     div.textContent = content;
   } else {
@@ -285,8 +316,8 @@ async function handleToolFlow(start) {
 
     if (choice?.finish_reason === 'tool_calls' && msg?.tool_calls?.length) {
       // Show thinking indicator briefly then remove
-      contentEl.textContent = msg.content || '';
-      if (!msg.content) assistantDiv.remove();
+      if (msg.content) { contentEl.innerHTML = renderMarkdown(msg.content); }
+      else { assistantDiv.remove(); }
 
       // Add assistant message with tool_calls to history
       messages.push(msg);
@@ -307,7 +338,7 @@ async function handleToolFlow(start) {
     } else {
       // Normal text response — done
       const text = msg?.content || '';
-      contentEl.textContent = text;
+      contentEl.innerHTML = renderMarkdown(text);
       messages.push({ role: 'assistant', content: text });
 
       const elapsed = (performance.now() - start) / 1000;
@@ -352,7 +383,7 @@ async function handleStreamFlow(start) {
         if (delta?.content) {
           fullText += delta.content;
           tokenCount++;
-          contentEl.textContent = fullText;
+          contentEl.innerHTML = renderMarkdown(fullText);
           document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
         }
         if (chunk.choices?.[0]?.finish_reason === 'stop') { streamDone = true; break; }
