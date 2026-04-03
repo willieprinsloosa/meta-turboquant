@@ -4,3 +4,4 @@ from turboquant.cache import TurboQuantKVCache
 from turboquant.cache_v2 import TurboQuantKVCacheV2
 from turboquant.cache_v3 import TurboQuantKVCacheV3
 from turboquant.protocol import TurboQuantCache
+from turboquant.utils import get_head_dim, make_cache

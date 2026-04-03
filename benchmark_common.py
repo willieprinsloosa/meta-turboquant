@@ -8,6 +8,7 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache, make_prompt_cache
 
 from turboquant.cache import TurboQuantKVCache
 from turboquant.cache_v2 import TurboQuantKVCacheV2
+from turboquant.utils import get_head_dim
 from turboquant.cache_v3 import TurboQuantKVCacheV3
 
 EVAL_TEXT = (
@@ -240,5 +241,5 @@ def make_cache(model, strategy):
         raise ValueError(f"Unknown strategy: {strategy}")
 
     n_layers = len(model.layers)
-    head_dim = model.layers[0].self_attn.head_dim
+    head_dim = get_head_dim(model)
     return factory(n_layers, head_dim)

@@ -18,6 +18,7 @@ from benchmark_common import compute_perplexity
 from turboquant.cache_v2 import TurboQuantKVCacheV2
 from turboquant.codebook import get_codebook_unscaled
 from turboquant.rotation import generate_rotation_matrix
+from turboquant.utils import get_head_dim
 import turboquant.patch as tq_patch
 
 tq_patch.apply()
@@ -162,7 +163,7 @@ def main():
     print(f"Loading model: {MODEL_NAME}")
     model, tokenizer = mlx_lm.load(MODEL_NAME)
     n_layers = len(model.layers)
-    head_dim = model.layers[0].self_attn.head_dim
+    head_dim = get_head_dim(model)
     print(f"Model loaded: {n_layers} layers, head_dim={head_dim}\n")
 
     ppl_configs = [

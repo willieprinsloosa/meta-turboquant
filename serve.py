@@ -62,7 +62,7 @@ def _make_sampler(temperature=0.7):
     return sampler
 
 
-def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None):
+def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None, stop=None):
     """Generates a response from chat messages."""
     template_kwargs = {"tokenize": False, "add_generation_prompt": True}
     if tools:
@@ -73,6 +73,9 @@ def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None
 
     tokens = []
     token_buffer = []
+    full_decoded = ""
+    stop_hit = False
+
     for token, _ in generate_step(
         prompt=input_ids,
         model=MODEL,
@@ -84,22 +87,47 @@ def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None
         if tok == TOKENIZER.eos_token_id:
             break
         tokens.append(tok)
+
         if stream:
-            # Buffer tokens and only yield when we have valid UTF-8 (#8)
             token_buffer.append(tok)
             text = TOKENIZER.decode(token_buffer)
             if text and not text.endswith("\ufffd"):
+                # Check stop sequences before yielding
+                if stop:
+                    full_decoded += text
+                    for s in stop:
+                        if s in full_decoded:
+                            # Yield text up to the stop sequence
+                            idx = full_decoded.rfind(s)
+                            trimmed = full_decoded[:idx]
+                            if trimmed:
+                                yield trimmed
+                            stop_hit = True
+                            break
+                    if stop_hit:
+                        break
                 yield text
                 token_buffer = []
 
-    # Flush any remaining buffered tokens
+    if stop_hit:
+        return
+
+    # Flush remaining buffer
     if stream and token_buffer:
         text = TOKENIZER.decode(token_buffer)
         if text:
             yield text
 
     if not stream:
-        yield TOKENIZER.decode(tokens)
+        decoded = TOKENIZER.decode(tokens)
+        # Trim at stop sequence
+        if stop:
+            for s in stop:
+                idx = decoded.find(s)
+                if idx != -1:
+                    decoded = decoded[:idx]
+                    break
+        yield decoded
 
 
 # --- Tool call parsing ---
@@ -273,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             return None
 
-    def _stream_response(self, messages, max_tokens, temperature, model_id, tools=None):
+    def _stream_response(self, messages, max_tokens, temperature, model_id, tools=None, stop=None):
         """Shared streaming logic for chat and responses endpoints.
 
         Handles BrokenPipeError (#1), consistent chunk IDs (#4),
@@ -281,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         # Force non-streaming when tools are present (#6)
         if tools:
-            return self._non_stream_response(messages, max_tokens, temperature, model_id, tools)
+            return self._non_stream_response(messages, max_tokens, temperature, model_id, tools, stop)
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -298,7 +326,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(first)}\n\n".encode())
             self.wfile.flush()
 
-            for chunk_text in generate(messages, max_tokens, temperature, stream=True, tools=None):
+            for chunk_text in generate(messages, max_tokens, temperature, stream=True, tools=None, stop=stop):
                 chunk = make_stream_chunk(stream_id, model_id, content=chunk_text)
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
@@ -310,9 +338,9 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             print("  [client disconnected]")
 
-    def _non_stream_response(self, messages, max_tokens, temperature, model_id, tools=None):
+    def _non_stream_response(self, messages, max_tokens, temperature, model_id, tools=None, stop=None):
         """Non-streaming response with tool call parsing."""
-        full_text = next(generate(messages, max_tokens, temperature, stream=False, tools=tools))
+        full_text = next(generate(messages, max_tokens, temperature, stream=False, tools=tools, stop=stop))
         elapsed = time.perf_counter() - self._request_start
 
         tool_calls = _parse_tool_calls(full_text) if tools else []
@@ -344,6 +372,10 @@ class Handler(BaseHTTPRequestHandler):
         temperature = body.get("temperature", 0.7)
         stream = body.get("stream", False)
         tools = body.get("tools", None)
+        stop = body.get("stop", None)
+        # Normalize stop to a list
+        if isinstance(stop, str):
+            stop = [stop]
 
         if not messages:
             self._send_json({"error": "messages required"}, 400)
@@ -353,9 +385,9 @@ class Handler(BaseHTTPRequestHandler):
         self._request_start = time.perf_counter()
 
         if stream:
-            self._stream_response(messages, max_tokens, temperature, model_id, tools)
+            self._stream_response(messages, max_tokens, temperature, model_id, tools, stop)
         else:
-            self._non_stream_response(messages, max_tokens, temperature, model_id, tools)
+            self._non_stream_response(messages, max_tokens, temperature, model_id, tools, stop)
 
     def _handle_responses(self, body):
         """Handles /v1/responses requests (OpenAI Responses API)."""

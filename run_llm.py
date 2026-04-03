@@ -11,6 +11,7 @@ import mlx_lm
 from mlx_lm.generate import generate_step
 
 from turboquant.cache_v2 import TurboQuantKVCacheV2
+from turboquant.utils import get_head_dim
 import turboquant.patch as tq_patch
 tq_patch.apply()
 
@@ -21,7 +22,7 @@ MAX_TOKENS = 100
 
 def make_turboquant_cache(model, bits=3, group_size=64, use_qjl=False):
     """Creates TurboQuant V2 KV-Caches for all layers."""
-    head_dim = model.layers[0].self_attn.head_dim
+    head_dim = get_head_dim(model)
     return [
         TurboQuantKVCacheV2(
             head_dim=head_dim, bits=bits, group_size=group_size,
@@ -62,7 +63,7 @@ def main():
     print(f"Loading model: {MODEL_NAME}")
     model, tokenizer = mlx_lm.load(MODEL_NAME)
 
-    head_dim = model.layers[0].self_attn.head_dim
+    head_dim = get_head_dim(model)
     n_layers = len(model.layers)
     print(f"Model loaded: {n_layers} layers, head_dim={head_dim}")
 

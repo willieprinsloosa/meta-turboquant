@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx_lm
 
 from benchmark_common import EVAL_TEXT, compute_perplexity, make_cache
+from turboquant.utils import get_head_dim
 import turboquant.patch as tq_patch
 
 tq_patch.apply()
@@ -46,7 +47,7 @@ def main():
 
         model, tokenizer = mlx_lm.load(model_name)
         n_layers = len(model.layers)
-        head_dim = model.layers[0].self_attn.head_dim
+        head_dim = get_head_dim(model)
         print(f"  {n_layers} layers, head_dim={head_dim}\n")
 
         fp16_ppl = None
