@@ -8,3 +8,4 @@ claude-files/
 *.egg-info/
 dist/
 build/
+logs/

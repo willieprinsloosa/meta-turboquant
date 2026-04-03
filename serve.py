@@ -20,11 +20,15 @@ Environment:
 
 import argparse
 import json
+import logging
 import os
 import re
+import sys
 import time
 import threading
+import traceback
 import uuid
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -36,6 +40,33 @@ from turboquant.utils import get_head_dim, make_cache
 import turboquant.patch as tq_patch
 
 tq_patch.apply()
+
+# --- Logging ---
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+log = logging.getLogger("turboquant")
+log.setLevel(logging.DEBUG)
+
+# File handler — detailed logs with timestamps
+_log_file = os.path.join(LOG_DIR, f"server_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+_fh = logging.FileHandler(_log_file)
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+log.addHandler(_fh)
+
+# Console handler — concise
+_ch = logging.StreamHandler(sys.stdout)
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(logging.Formatter("%(message)s"))
+log.addHandler(_ch)
+
+# Crash log — append-only, survives restarts
+_crash_file = os.path.join(LOG_DIR, "crashes.log")
+_crash_fh = logging.FileHandler(_crash_file)
+_crash_fh.setLevel(logging.ERROR)
+_crash_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+log.addHandler(_crash_fh)
 
 # --- Constants ---
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -245,7 +276,7 @@ _inference_lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        print(f"  {self.client_address[0]} {format % args}")
+        log.debug(f"{self.client_address[0]} {format % args}")
 
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode()
@@ -267,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_cors()
 
     def do_GET(self):
-        print(f"\n>> GET {self.path}")
+        log.info(f"\n>> GET {self.path}")
         if self.path == "/v1/models":
             self._send_json({
                 "object": "list",
@@ -336,7 +367,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            print("  [client disconnected]")
+            log.info("  [client disconnected during streaming]")
 
     def _non_stream_response(self, messages, max_tokens, temperature, model_id, tools=None, stop=None):
         """Non-streaming response with tool call parsing."""
@@ -361,9 +392,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(response)
         if tool_calls:
             names = [tc["function"]["name"] for tc in tool_calls]
-            print(f"  [tool_calls: {names}, {elapsed:.1f}s]")
+            log.info(f"  [tool_calls: {names}, {elapsed:.1f}s]")
         else:
-            print(f"  [{completion_tokens} tokens, {elapsed:.1f}s, {_tok_per_sec(completion_tokens, elapsed)} tok/s]")
+            log.info(f"  [{completion_tokens} tokens, {elapsed:.1f}s, {_tok_per_sec(completion_tokens, elapsed)} tok/s]")
 
     def _handle_chat(self, body):
         """Handles /v1/chat/completions requests."""
@@ -446,25 +477,28 @@ class Handler(BaseHTTPRequestHandler):
             response = make_responses_response(full_text, model_id)
             self._send_json(response)
             tok_count = len(TOKENIZER.encode(full_text))
-            print(f"  [responses] [{tok_count} tokens, {elapsed:.1f}s, {_tok_per_sec(tok_count, elapsed)} tok/s]")
+            log.info(f"  [responses] [{tok_count} tokens, {elapsed:.1f}s, {_tok_per_sec(tok_count, elapsed)} tok/s]")
 
     def do_POST(self):
-        print(f"\n>> POST {self.path}")
+        log.info(f"\n>> POST {self.path}")
         body = self._parse_body()
 
         # (#2) Handle malformed/oversized requests
         if body is None:
+            log.warning(f"  400 — invalid or missing JSON body from {self.client_address[0]}")
             self._send_json({"error": "invalid or missing JSON body"}, 400)
             return
 
-        print(f"   stream: {body.get('stream', 'NOT SET')}, model: {body.get('model', 'NOT SET')}")
+        log.info(f"   stream: {body.get('stream', 'NOT SET')}, model: {body.get('model', 'NOT SET')}")
 
         if self.path not in ("/v1/chat/completions", "/v1/responses"):
+            log.warning(f"  404 — unknown endpoint: {self.path}")
             self._send_json({"error": "not found"}, 404)
             return
 
         # (#7) Lock with timeout — return 503 if busy
         if not _inference_lock.acquire(timeout=LOCK_TIMEOUT):
+            log.warning(f"  503 — server busy, lock timeout after {LOCK_TIMEOUT}s")
             self._send_json({"error": "server busy, try again later"}, 503)
             return
         try:
@@ -472,6 +506,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_chat(body)
             else:
                 self._handle_responses(body)
+        except (BrokenPipeError, ConnectionResetError):
+            log.info("  [client disconnected during response]")
+        except Exception:
+            tb = traceback.format_exc()
+            log.error(f"CRASH in {self.path}:\n{tb}")
+            try:
+                self._send_json({"error": "internal server error"}, 500)
+            except Exception:
+                pass
         finally:
             _inference_lock.release()
 
@@ -496,37 +539,40 @@ def main():
     GROUP_SIZE = args.group_size
     LEAN = args.lean
 
-    print(f"Loading model: {MODEL_NAME}")
+    log.info(f"Loading model: {MODEL_NAME}")
     MODEL, TOKENIZER = mlx_lm.load(MODEL_NAME)
     HEAD_DIM = get_head_dim(MODEL)
     N_LAYERS = len(MODEL.layers)
-    print(f"  {N_LAYERS} layers, head_dim={HEAD_DIM}")
+    log.info(f"  {N_LAYERS} layers, head_dim={HEAD_DIM}")
     mode = "LEAN" if LEAN else "rotated"
-    print(f"  Strategy: {STRATEGY.upper()} {BITS}-bit {mode} (group_size={GROUP_SIZE})")
+    log.info(f"  Strategy: {STRATEGY.upper()} {BITS}-bit {mode} (group_size={GROUP_SIZE})")
 
     # Warmup
-    print("Warming up...")
+    log.info("Warming up...")
     cache = make_cache(N_LAYERS, HEAD_DIM, STRATEGY, BITS, GROUP_SIZE, LEAN)
     warmup_ids = mx.array(TOKENIZER.encode("Hello"))
     for tok, _ in generate_step(prompt=warmup_ids, model=MODEL, max_tokens=1, prompt_cache=cache):
         break
-    print("Ready.")
+    log.info("Ready.")
+
+    log.info(f"Log file: {_log_file}")
+    log.info(f"Crash log: {_crash_file}")
 
     server = ThreadedHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"\nServing on http://localhost:{args.port}")
-    print(f"  POST /v1/chat/completions  — OpenAI-compatible chat")
-    print(f"  POST /v1/responses         — OpenAI Responses API")
-    print(f"  GET  /v1/models            — list models")
-    print(f"  GET  /health               — health check")
-    print(f"\nOpenClaw config:")
-    print(f'  Provider URL: http://localhost:{args.port}/v1')
-    print(f'  Model: {MODEL_NAME}')
-    print()
+    log.info(f"\nServing on http://localhost:{args.port}")
+    log.info(f"  POST /v1/chat/completions  — OpenAI-compatible chat")
+    log.info(f"  POST /v1/responses         — OpenAI Responses API")
+    log.info(f"  GET  /v1/models            — list models")
+    log.info(f"  GET  /health               — health check")
+    log.info(f"\nOpenClaw config:")
+    log.info(f'  Provider URL: http://localhost:{args.port}/v1')
+    log.info(f'  Model: {MODEL_NAME}')
+    log.info("")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down.")
+        log.info("\nShutting down.")
         server.server_close()
 
 
