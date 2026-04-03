@@ -20,12 +20,14 @@ header .model { font-size: 12px; color: #888; margin-left: auto; }
 .msg.user { align-self: flex-end; background: #0f3460; color: #fff; border-bottom-right-radius: 4px; }
 .msg.assistant { align-self: flex-start; background: #222; color: #e0e0e0; border-bottom-left-radius: 4px; }
 .msg.assistant .label { font-size: 11px; color: #e94560; margin-bottom: 4px; font-weight: 600; }
+.msg.tool-call { align-self: flex-start; background: #1a2744; border: 1px solid #0f3460; color: #4ecca3; font-size: 13px; max-width: 90%; }
+.msg.tool-call .tool-label { font-size: 11px; color: #e94560; margin-bottom: 4px; font-weight: 600; }
+.msg.tool-call .tool-name { color: #4ecca3; font-weight: 600; }
+.msg.tool-call .tool-args { color: #aaa; font-size: 12px; margin-top: 4px; }
+.msg.tool-result { align-self: flex-start; background: #1a2e1a; border: 1px solid #2d5a2d; color: #8bc34a; font-size: 13px; max-width: 90%; }
+.msg.tool-result .tool-label { font-size: 11px; color: #8bc34a; margin-bottom: 4px; font-weight: 600; }
 .msg.system { align-self: center; background: none; color: #666; font-size: 12px; font-style: italic; }
 .msg .stats { font-size: 11px; color: #555; margin-top: 8px; }
-
-.msg code { background: #333; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
-.msg pre { background: #111; padding: 10px; border-radius: 6px; margin: 8px 0; overflow-x: auto; }
-.msg pre code { background: none; padding: 0; }
 
 .typing { display: inline-block; }
 .typing span { display: inline-block; width: 6px; height: 6px; background: #e94560; border-radius: 50%; margin: 0 2px; animation: bounce 1.4s infinite; }
@@ -41,9 +43,11 @@ header .model { font-size: 12px; color: #888; margin-left: auto; }
 #send:hover { background: #c73e54; }
 #send:disabled { background: #555; cursor: not-allowed; }
 
-.toolbar { padding: 6px 20px; background: #16213e; display: flex; gap: 10px; font-size: 12px; }
+.toolbar { padding: 6px 20px; background: #16213e; display: flex; gap: 10px; font-size: 12px; align-items: center; }
 .toolbar button { background: none; border: 1px solid #333; color: #888; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; }
 .toolbar button:hover { border-color: #e94560; color: #e94560; }
+.toolbar button.active { border-color: #4ecca3; color: #4ecca3; }
+.toolbar .tools-status { margin-left: auto; font-size: 11px; color: #555; }
 </style>
 </head>
 <body>
@@ -57,12 +61,14 @@ header .model { font-size: 12px; color: #888; margin-left: auto; }
 <div class="toolbar">
   <button onclick="clearChat()">Clear</button>
   <button onclick="toggleSystem()">System Prompt</button>
+  <button id="tools-btn" onclick="toggleTools()">Tools: OFF</button>
+  <span class="tools-status" id="tools-status"></span>
 </div>
 
 <div id="chat"></div>
 
 <div id="input-area">
-  <textarea id="input" placeholder="Type a message..." rows="1" onkeydown="handleKey(event)"></textarea>
+  <textarea id="input" placeholder="Type a message... (try 'What's the weather in Tokyo?' with tools on)" rows="1" onkeydown="handleKey(event)"></textarea>
   <button id="send" onclick="sendMessage()">Send</button>
 </div>
 
@@ -71,6 +77,74 @@ const API = 'http://localhost:11434/v1';
 let messages = [];
 let generating = false;
 let modelName = '';
+let toolsEnabled = false;
+
+// --- Demo tools (simulated) ---
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Get the current weather for a city',
+      parameters: { type: 'object', properties: { city: { type: 'string', description: 'City name' }, unit: { type: 'string', enum: ['celsius', 'fahrenheit'] } }, required: ['city'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_web',
+      description: 'Search the web for information',
+      parameters: { type: 'object', properties: { query: { type: 'string', description: 'Search query' } }, required: ['query'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'calculate',
+      description: 'Evaluate a mathematical expression',
+      parameters: { type: 'object', properties: { expression: { type: 'string', description: 'Math expression' } }, required: ['expression'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_time',
+      description: 'Get the current date and time',
+      parameters: { type: 'object', properties: { timezone: { type: 'string', description: 'Timezone (e.g. UTC, US/Eastern)' } }, required: [] },
+    },
+  },
+];
+
+// Simulated tool execution
+function executeTool(name, args) {
+  switch (name) {
+    case 'get_weather': {
+      const city = args.city || 'Unknown';
+      const temps = { 'tokyo': 22, 'london': 15, 'paris': 18, 'new york': 12, 'sydney': 25 };
+      const conditions = { 'tokyo': 'sunny', 'london': 'rainy', 'paris': 'cloudy', 'new york': 'windy', 'sydney': 'sunny' };
+      const temp = temps[city.toLowerCase()] || Math.floor(Math.random() * 30 + 5);
+      const cond = conditions[city.toLowerCase()] || 'partly cloudy';
+      const unit = args.unit === 'fahrenheit' ? 'F' : 'C';
+      const t = unit === 'F' ? Math.round(temp * 9/5 + 32) : temp;
+      return JSON.stringify({ city, temperature: t, unit, condition: cond, humidity: Math.floor(Math.random() * 40 + 40) });
+    }
+    case 'search_web':
+      return JSON.stringify({ results: [
+        { title: `Top result for: ${args.query}`, snippet: `Here is the latest information about ${args.query}. This is simulated search data for demo purposes.` },
+        { title: `${args.query} - Wikipedia`, snippet: `${args.query} is a topic of significant interest...` },
+      ]});
+    case 'calculate': {
+      try { return JSON.stringify({ expression: args.expression, result: eval(args.expression) }); }
+      catch { return JSON.stringify({ expression: args.expression, error: 'Could not evaluate' }); }
+    }
+    case 'get_time': {
+      const now = new Date();
+      return JSON.stringify({ timezone: args.timezone || 'local', datetime: now.toISOString(), formatted: now.toLocaleString() });
+    }
+    default:
+      return JSON.stringify({ error: `Unknown tool: ${name}` });
+  }
+}
 
 async function checkHealth() {
   try {
@@ -109,11 +183,63 @@ function addMessage(role, content, stats) {
   return div;
 }
 
+function addToolCallMessage(name, args) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg tool-call';
+  div.innerHTML = `<div class="tool-label">Tool Call</div><div class="tool-name">${name}()</div><div class="tool-args">${JSON.stringify(args, null, 2)}</div>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addToolResultMessage(name, result) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg tool-result';
+  try {
+    const parsed = JSON.parse(result);
+    div.innerHTML = `<div class="tool-label">Tool Result: ${name}</div><div>${JSON.stringify(parsed, null, 2)}</div>`;
+  } catch {
+    div.innerHTML = `<div class="tool-label">Tool Result: ${name}</div><div>${result}</div>`;
+  }
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
 function setGenerating(v) {
   generating = v;
   document.getElementById('send').disabled = v;
   document.getElementById('input').disabled = v;
   if (!v) document.getElementById('input').focus();
+}
+
+async function callLLM(msgs, useTools) {
+  const body = {
+    model: modelName,
+    messages: msgs,
+    max_tokens: 512,
+  };
+
+  if (useTools) {
+    // Non-streaming for tool calls (server forces this anyway)
+    body.tools = TOOLS;
+    body.stream = false;
+    const resp = await fetch(`${API}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return await resp.json();
+  } else {
+    // Streaming for normal chat
+    body.stream = true;
+    const resp = await fetch(`${API}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return resp;
+  }
 }
 
 async function sendMessage() {
@@ -127,72 +253,122 @@ async function sendMessage() {
   addMessage('user', text);
 
   setGenerating(true);
+  const start = performance.now();
+
+  try {
+    if (toolsEnabled) {
+      await handleToolFlow(start);
+    } else {
+      await handleStreamFlow(start);
+    }
+  } catch (err) {
+    addMessage('system', `Error: ${err.message}`);
+  }
+
+  setGenerating(false);
+}
+
+async function handleToolFlow(start) {
+  // Tool calling loop — may iterate multiple times
+  let iterations = 0;
+  const maxIterations = 5;
+
+  while (iterations < maxIterations) {
+    iterations++;
+    const assistantDiv = addMessage('assistant', '');
+    const contentEl = assistantDiv.querySelector('.content');
+    contentEl.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+
+    const result = await callLLM(messages, true);
+    const choice = result.choices?.[0];
+    const msg = choice?.message;
+
+    if (choice?.finish_reason === 'tool_calls' && msg?.tool_calls?.length) {
+      // Show thinking indicator briefly then remove
+      contentEl.textContent = msg.content || '';
+      if (!msg.content) assistantDiv.remove();
+
+      // Add assistant message with tool_calls to history
+      messages.push(msg);
+
+      // Execute each tool call
+      for (const tc of msg.tool_calls) {
+        const args = JSON.parse(tc.function.arguments);
+        addToolCallMessage(tc.function.name, args);
+
+        // Execute the tool
+        const toolResult = executeTool(tc.function.name, args);
+        addToolResultMessage(tc.function.name, toolResult);
+
+        // Add tool result to history
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
+      }
+      // Continue loop — model will process tool results
+    } else {
+      // Normal text response — done
+      const text = msg?.content || '';
+      contentEl.textContent = text;
+      messages.push({ role: 'assistant', content: text });
+
+      const elapsed = (performance.now() - start) / 1000;
+      const statsEl = document.createElement('div');
+      statsEl.className = 'stats';
+      statsEl.textContent = `${result.usage?.completion_tokens || '?'} tokens, ${elapsed.toFixed(1)}s`;
+      assistantDiv.appendChild(statsEl);
+      break;
+    }
+  }
+}
+
+async function handleStreamFlow(start) {
   const assistantDiv = addMessage('assistant', '');
   const contentEl = assistantDiv.querySelector('.content');
   contentEl.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
 
-  const start = performance.now();
   let fullText = '';
   let tokenCount = 0;
 
-  try {
-    const resp = await fetch(`${API}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: modelName,
-        messages: messages,
-        stream: true,
-        max_tokens: 512,
-      }),
-    });
+  const resp = await callLLM(messages, false);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let streamDone = false;
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let streamDone = false;
+  while (!streamDone) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-    while (!streamDone) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6);
-        if (data === '[DONE]') { streamDone = true; break; }
-        try {
-          const chunk = JSON.parse(data);
-          const delta = chunk.choices?.[0]?.delta;
-          if (delta?.content) {
-            fullText += delta.content;
-            tokenCount++;
-            contentEl.textContent = fullText;
-            document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
-          }
-          if (chunk.choices?.[0]?.finish_reason === 'stop') { streamDone = true; break; }
-        } catch {}
-      }
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6);
+      if (data === '[DONE]') { streamDone = true; break; }
+      try {
+        const chunk = JSON.parse(data);
+        const delta = chunk.choices?.[0]?.delta;
+        if (delta?.content) {
+          fullText += delta.content;
+          tokenCount++;
+          contentEl.textContent = fullText;
+          document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+        }
+        if (chunk.choices?.[0]?.finish_reason === 'stop') { streamDone = true; break; }
+      } catch {}
     }
-    reader.cancel();
-
-    const elapsed = (performance.now() - start) / 1000;
-    const tps = tokenCount / Math.max(elapsed, 0.001);
-    const statsEl = document.createElement('div');
-    statsEl.className = 'stats';
-    statsEl.textContent = `${tokenCount} tokens, ${elapsed.toFixed(1)}s, ${tps.toFixed(0)} tok/s`;
-    assistantDiv.appendChild(statsEl);
-
-    messages.push({ role: 'assistant', content: fullText });
-  } catch (err) {
-    contentEl.textContent = `Error: ${err.message}`;
-    contentEl.style.color = '#e94560';
   }
+  reader.cancel();
 
-  setGenerating(false);
+  const elapsed = (performance.now() - start) / 1000;
+  const tps = tokenCount / Math.max(elapsed, 0.001);
+  const statsEl = document.createElement('div');
+  statsEl.className = 'stats';
+  statsEl.textContent = `${tokenCount} tokens, ${elapsed.toFixed(1)}s, ${tps.toFixed(0)} tok/s`;
+  assistantDiv.appendChild(statsEl);
+
+  messages.push({ role: 'assistant', content: fullText });
 }
 
 function clearChat() {
@@ -212,12 +388,24 @@ function toggleSystem() {
   }
 }
 
+function toggleTools() {
+  toolsEnabled = !toolsEnabled;
+  const btn = document.getElementById('tools-btn');
+  btn.textContent = toolsEnabled ? 'Tools: ON' : 'Tools: OFF';
+  btn.className = toolsEnabled ? 'active' : '';
+  document.getElementById('tools-status').textContent = toolsEnabled
+    ? 'weather, search, calculate, time'
+    : '';
+  addMessage('system', toolsEnabled
+    ? 'Tools enabled: get_weather, search_web, calculate, get_time'
+    : 'Tools disabled — streaming mode');
+}
+
 function handleKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendMessage();
   }
-  // Auto-resize
   setTimeout(() => {
     e.target.style.height = 'auto';
     e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
