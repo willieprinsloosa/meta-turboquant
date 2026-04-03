@@ -150,8 +150,9 @@ async function sendMessage() {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let streamDone = false;
 
-    while (true) {
+    while (!streamDone) {
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -162,7 +163,7 @@ async function sendMessage() {
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         const data = line.slice(6);
-        if (data === '[DONE]') break;
+        if (data === '[DONE]') { streamDone = true; break; }
         try {
           const chunk = JSON.parse(data);
           const delta = chunk.choices?.[0]?.delta;
@@ -172,9 +173,11 @@ async function sendMessage() {
             contentEl.textContent = fullText;
             document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
           }
+          if (chunk.choices?.[0]?.finish_reason === 'stop') { streamDone = true; break; }
         } catch {}
       }
     }
+    reader.cancel();
 
     const elapsed = (performance.now() - start) / 1000;
     const tps = tokenCount / Math.max(elapsed, 0.001);
