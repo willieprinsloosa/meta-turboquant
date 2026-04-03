@@ -19,6 +19,16 @@ _patched = False
 
 
 def _patched_sdpa(queries, keys, values, cache, scale, mask, **kwargs):
+    # KVTC cache (PCA transform coding)
+    from turboquant.cache_kvtc import KVTCCache
+    if isinstance(cache, KVTCCache):
+        from turboquant.attention_hybrid import hybrid_sdpa
+        return hybrid_sdpa(queries, keys, values, cache, scale, mask)
+    # Hybrid cache (sliding window)
+    from turboquant.cache_hybrid import HybridKVCache
+    if isinstance(cache, HybridKVCache):
+        from turboquant.attention_hybrid import hybrid_sdpa
+        return hybrid_sdpa(queries, keys, values, cache, scale, mask)
     if isinstance(cache, TurboQuantKVCacheV3):
         return turboquant_v3_sdpa(queries, cache, scale, mask)
     if isinstance(cache, TurboQuantKVCacheV2):
