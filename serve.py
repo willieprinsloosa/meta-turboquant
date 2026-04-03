@@ -299,7 +299,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         log.info(f"\n>> GET {self.path}")
-        if self.path == "/v1/models":
+        if self.path == "/chat":
+            self._serve_chat_ui()
+        elif self.path == "/v1/models":
             self._send_json({
                 "object": "list",
                 "data": [{
@@ -314,10 +316,29 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }],
             })
-        elif self.path in ("/health", "/v1", "/"):
+        elif self.path in ("/health", "/v1"):
             self._send_json({"status": "ok", "model": MODEL_NAME})
+        elif self.path == "/":
+            # Redirect root to chat UI
+            self.send_response(302)
+            self.send_header("Location", "/chat")
+            self.end_headers()
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _serve_chat_ui(self):
+        """Serves the built-in chat UI from samples/chat.html."""
+        chat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples", "chat.html")
+        try:
+            with open(chat_path, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except FileNotFoundError:
+            self._send_json({"error": "chat UI not found"}, 404)
 
     def _parse_body(self):
         """Parse JSON body with error handling (#2) and size limit (#9)."""
