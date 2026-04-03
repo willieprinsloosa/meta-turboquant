@@ -161,6 +161,59 @@ def generate(messages, max_tokens=512, temperature=0.7, stream=False, tools=None
         yield decoded
 
 
+# --- Output post-processing ---
+
+def _clean_react_output(text):
+    """Strips ReAct reasoning traces and extracts the final answer.
+
+    1-bit models sometimes emit raw ReAct format:
+      Thought: I need to...
+      Action: search
+      Action Input: ...
+      Observation: ...
+      Final Answer: The actual response
+
+    This extracts just the final answer, or cleans up partial reasoning.
+    """
+    if not text:
+        return text
+
+    # If there's a "Final Answer:" extract everything after it
+    for marker in ("Final Answer:", "Final Answer :", "final answer:"):
+        idx = text.lower().find(marker.lower())
+        if idx != -1:
+            return text[idx + len(marker):].strip()
+
+    # If there's reasoning but no final answer, check for common patterns
+    has_react = any(m in text for m in ("Thought:", "Action:", "Observation:", "Action Input:"))
+    if not has_react:
+        return text
+
+    # Strip Thought/Action/Observation lines and keep the rest
+    lines = text.split("\n")
+    clean_lines = []
+    skip_next = False
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(p) for p in ("Thought:", "Action:", "Action Input:", "Observation:")):
+            skip_next = False
+            continue
+        if stripped:
+            clean_lines.append(line)
+
+    cleaned = "\n".join(clean_lines).strip()
+
+    # If everything was reasoning and nothing remains, return the last
+    # Observation or the original text as fallback
+    if not cleaned:
+        for line in reversed(lines):
+            if line.strip().startswith("Observation:"):
+                return line.strip()[len("Observation:"):].strip()
+        return text
+
+    return cleaned
+
+
 # --- Tool call parsing ---
 
 def _parse_tool_calls(text):
@@ -391,11 +444,15 @@ class Handler(BaseHTTPRequestHandler):
             log.info("  [client disconnected during streaming]")
 
     def _non_stream_response(self, messages, max_tokens, temperature, model_id, tools=None, stop=None):
-        """Non-streaming response with tool call parsing."""
+        """Non-streaming response with tool call parsing and ReAct cleanup."""
         full_text = next(generate(messages, max_tokens, temperature, stream=False, tools=tools, stop=stop))
         elapsed = time.perf_counter() - self._request_start
 
         tool_calls = _parse_tool_calls(full_text) if tools else []
+
+        # Clean up ReAct reasoning traces from 1-bit model output
+        if not tool_calls:
+            full_text = _clean_react_output(full_text)
 
         template_kwargs = {"tokenize": False, "add_generation_prompt": True}
         if tools:
@@ -494,6 +551,7 @@ class Handler(BaseHTTPRequestHandler):
             self._stream_response(messages, max_tokens, temperature, model_id)
         else:
             full_text = next(generate(messages, max_tokens, temperature, stream=False))
+            full_text = _clean_react_output(full_text)
             elapsed = time.perf_counter() - self._request_start
             response = make_responses_response(full_text, model_id)
             self._send_json(response)
