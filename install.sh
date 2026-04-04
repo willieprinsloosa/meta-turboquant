@@ -128,12 +128,28 @@ fi
 source .venv13/bin/activate
 
 # ── Step 8: Install dependencies ────────────────────────────
-info "Installing AI framework (this compiles from source, ~5 minutes)..."
+info "Installing AI framework..."
 pip install --upgrade pip -q 2>/dev/null
 
-# Install PrismML MLX fork with 1-bit support
-pip install mlx@git+https://github.com/PrismML-Eng/mlx.git@prism mlx-lm numpy pytest -q 2>&1 | tail -3
-ok "AI framework installed"
+# Try pre-built wheel first (no Xcode needed, ~10 seconds)
+WHEEL_DIR="$(dirname "$0")/wheels"
+if ls "$WHEEL_DIR"/mlx-*.whl 1>/dev/null 2>&1; then
+    info "Using pre-built wheel (no Xcode required)..."
+    pip install "$WHEEL_DIR"/mlx-*.whl mlx-lm numpy pytest -q 2>&1 | tail -3
+    ok "AI framework installed (from wheel — no compilation needed)"
+else
+    # Fall back to building from source (~5 minutes, needs Metal Toolchain)
+    warn "No pre-built wheel found. Building from source (~5 minutes)..."
+
+    # Ensure Metal Toolchain is available
+    if ! xcrun metal --version &>/dev/null 2>&1; then
+        info "Installing Metal Toolchain..."
+        xcodebuild -downloadComponent MetalToolchain 2>&1 | tail -1
+    fi
+
+    pip install mlx@git+https://github.com/PrismML-Eng/mlx.git@prism mlx-lm numpy pytest -q 2>&1 | tail -3
+    ok "AI framework installed (compiled from source)"
+fi
 
 # ── Step 9: Verify 1-bit support ────────────────────────────
 info "Verifying 1-bit model support..."
