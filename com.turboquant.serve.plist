@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.turboquant.serve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/meta-turboquant/.venv13/bin/python3</string>
+        <string>/opt/meta-turboquant/serve.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/opt/meta-turboquant</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TOKENIZERS_PARALLELISM</key>
+        <string>false</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/opt/meta-turboquant/logs/serve.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/opt/meta-turboquant/logs/serve.err</string>
+</dict>
+</plist>
