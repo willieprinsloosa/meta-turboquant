@@ -307,6 +307,45 @@ Bonsai models require the `.venv13` environment (Python 3.13 + PrismML MLX fork)
 
 With TurboQuant V2 4-bit compression, an 8B model on 16GB can handle ~32K context tokens.
 
+## Running as a macOS Service (launchd)
+
+A `com.turboquant.serve.plist` is included to run the server automatically at login and restart it on failure.
+
+### Setup
+
+```bash
+# 1. Create logs directory
+mkdir -p /opt/meta-turboquant/logs
+
+# 2. Copy plist to LaunchAgents
+cp /opt/meta-turboquant/com.turboquant.serve.plist ~/Library/LaunchAgents/
+
+# 3. Load and start the service
+launchctl load ~/Library/LaunchAgents/com.turboquant.serve.plist
+```
+
+The service uses the `.venv13` virtualenv (Python 3.13 + PrismML MLX fork). Make sure it is set up first — see [Bonsai 1-bit models](#bonsai-1-bit-models-requires-python-313--prismml-mlx-fork) in the installation section.
+
+### Managing the service
+
+```bash
+# Stop the service
+launchctl unload ~/Library/LaunchAgents/com.turboquant.serve.plist
+
+# Restart
+launchctl unload ~/Library/LaunchAgents/com.turboquant.serve.plist
+launchctl load ~/Library/LaunchAgents/com.turboquant.serve.plist
+
+# Check status
+launchctl list | grep turboquant
+
+# View logs
+tail -f /opt/meta-turboquant/logs/serve.log
+tail -f /opt/meta-turboquant/logs/serve.err
+```
+
+The service starts automatically at login (`RunAtLoad`), restarts on crash (`KeepAlive`), and waits 10 seconds between restart attempts to avoid tight crash loops.
+
 ## OpenClaw Integration
 
 Meta-TurboQuant can serve as a **local LLM provider** for [OpenClaw](https://github.com/openclaw/openclaw).
